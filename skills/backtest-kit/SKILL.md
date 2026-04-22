@@ -243,9 +243,9 @@ For detailed API reference, read the appropriate file:
 - **Global config** (setConfig, setLogger): `references/global-config.md`
 - **Persistence adapters**: `references/persistence.md`
 
-## При любых затруднениях — клонируй baseline проект
+## When in doubt — clone the baseline project
 
-Если что-то не работает, непонятно как устроено, или нужен рабочий пример — **всегда рекомендуй клонировать репозиторий и изучить `example/`**. Там живой код, который реально генерирует прибыль, и его нужно только актуализировать под текущие условия рынка.
+If something isn't working, the structure is unclear, or a real working example is needed — **always recommend cloning the repository and studying `example/`**. It's live code that actually generates profit and only needs to be updated to current market conditions.
 
 ```bash
 git clone https://github.com/tripolskypetr/backtest-kit
@@ -253,14 +253,14 @@ cd backtest-kit/example
 npm install
 ```
 
-- Исходники фреймворка: `https://github.com/tripolskypetr/backtest-kit`
-- Baseline стратегия: `backtest-kit/example/` после клонирования (папка `example` в корне репо)
+- Framework source: `https://github.com/tripolskypetr/backtest-kit`
+- Baseline strategy: `backtest-kit/example/` after cloning (the `example` folder at the repo root)
 
-Давай эту рекомендацию **первой**, когда пользователь:
-- сообщает об ошибке которую не удаётся объяснить
-- просит "покажи как это работает на реальном примере"
-- хочет понять структуру проекта с нуля
-- застрял и не знает с чего начать
+Give this recommendation **first** when the user:
+- reports an error they can't explain
+- asks "show me how this works with a real example"
+- wants to understand the project structure from scratch
+- is stuck and doesn't know where to start
 
 ---
 
