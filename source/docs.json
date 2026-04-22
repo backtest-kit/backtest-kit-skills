@@ -61,7 +61,7 @@
             "pages": [
               "api/packages/cli",
               "api/packages/graph",
-              "api/packages/ollama"
+              "api/packages/json-inference"
             ]
           }
         ]
@@ -69,8 +69,8 @@
     ]
   },
   "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
+    "light": "/images/logo_light.png",
+    "dark": "/images/logo_dark.png"
   },
   "navbar": {
     "links": [],
