@@ -1,155 +1,270 @@
 ---
 title: "Build LLM-powered trading strategies with Backtest Kit"
-description: "Use getCandles for multi-timeframe data, send it to an LLM, parse the signal, and persist LLM context with Dump and Memory for RAG-based retrieval."
+description: "Use getCandles for multi-timeframe data, send it to an LLM via json-inference, parse the signal, and persist LLM context with Dump and Memory for RAG-based retrieval."
 ---
 
-Backtest Kit treats LLM inference as a regular async call inside `getSignal`. Your strategy gathers multi-timeframe candle data, formats it into a message history, sends it to an LLM, and parses the structured JSON response back into a signal DTO. The `Dump` class persists the conversation history and signal records so the model can review past decisions through RAG lookups using the `Memory` class.
+Backtest Kit treats LLM inference as a regular async call inside `getSignal`. Your strategy gathers multi-timeframe candle data, formats it into a message history, sends it to an LLM via `generateObject`, and maps the structured JSON response back to an `ISignalDto`. The `Dump` class persists the conversation history and signal records so the model can review past decisions through RAG lookups using the `Memory` class.
 
 ## Install the LLM package
 
 ```bash
-npm install @backtest-kit/ollama backtest-kit agent-swarm-kit
+npm install json-inference openai ollama groq-sdk backtest-kit
 ```
 
 ## Choose a provider
 
-`@backtest-kit/ollama` ships higher-order functions for every major provider. Each function wraps your `getSignal` implementation and injects the LLM client into the execution context.
+`json-inference` exports `generateObject` and `InferenceName` — one function, one enum, every provider. Change `InferenceName` to switch providers; the schema and messages stay identical.
 
 <CodeGroup>
 
 ```typescript deepseek.ts
+import { generateObject, InferenceName } from 'json-inference';
 import { addStrategySchema } from 'backtest-kit';
-import { deepseek } from '@backtest-kit/ollama';
 
 addStrategySchema({
   strategyName: 'deepseek-strategy',
   interval: '5m',
-  getSignal: deepseek(myGetSignal, 'deepseek-chat', process.env.DEEPSEEK_API_KEY),
+  getSignal: async (symbol, when, currentPrice) => {
+    return myGetSignal(symbol, currentPrice, InferenceName.DeepseekInference, 'deepseek-chat', process.env.DEEPSEEK_API_KEY);
+  },
 });
 ```
 
 ```typescript openai.ts
+import { generateObject, InferenceName } from 'json-inference';
 import { addStrategySchema } from 'backtest-kit';
-import { gpt5 } from '@backtest-kit/ollama';
 
 addStrategySchema({
   strategyName: 'gpt-strategy',
   interval: '5m',
-  getSignal: gpt5(myGetSignal, 'gpt-4o', process.env.OPENAI_API_KEY),
+  getSignal: async (symbol, when, currentPrice) => {
+    return myGetSignal(symbol, currentPrice, InferenceName.GPT5Inference, 'gpt-4o', process.env.OPENAI_API_KEY);
+  },
 });
 ```
 
 ```typescript claude.ts
+import { generateObject, InferenceName } from 'json-inference';
 import { addStrategySchema } from 'backtest-kit';
-import { claude } from '@backtest-kit/ollama';
 
 addStrategySchema({
   strategyName: 'claude-strategy',
   interval: '5m',
-  getSignal: claude(myGetSignal, 'claude-opus-4-5', process.env.ANTHROPIC_API_KEY),
+  getSignal: async (symbol, when, currentPrice) => {
+    return myGetSignal(symbol, currentPrice, InferenceName.ClaudeInference, 'claude-opus-4-5', process.env.ANTHROPIC_API_KEY);
+  },
 });
 ```
 
 ```typescript ollama.ts
+import { generateObject, InferenceName } from 'json-inference';
 import { addStrategySchema } from 'backtest-kit';
-import { ollama } from '@backtest-kit/ollama';
 
 addStrategySchema({
   strategyName: 'local-strategy',
   interval: '5m',
-  // Pass an array of keys for automatic rotation across instances
-  getSignal: ollama(myGetSignal, 'llama3.3:70b', process.env.OLLAMA_API_KEY),
+  getSignal: async (symbol, when, currentPrice) => {
+    // No API key needed for local Ollama
+    return myGetSignal(symbol, currentPrice, InferenceName.OllamaInference, 'llama3.3:70b');
+  },
 });
 ```
 
 ```typescript mistral.ts
+import { generateObject, InferenceName } from 'json-inference';
 import { addStrategySchema } from 'backtest-kit';
-import { mistral } from '@backtest-kit/ollama';
 
 addStrategySchema({
   strategyName: 'mistral-strategy',
   interval: '5m',
-  getSignal: mistral(myGetSignal, 'mistral-large-latest', process.env.MISTRAL_API_KEY),
+  getSignal: async (symbol, when, currentPrice) => {
+    return myGetSignal(symbol, currentPrice, InferenceName.MistralInference, 'mistral-large-latest', process.env.MISTRAL_API_KEY);
+  },
 });
 ```
 
 ```typescript grok.ts
+import { generateObject, InferenceName } from 'json-inference';
 import { addStrategySchema } from 'backtest-kit';
-import { grok } from '@backtest-kit/ollama';
 
 addStrategySchema({
   strategyName: 'grok-strategy',
   interval: '5m',
-  getSignal: grok(myGetSignal, 'grok-3', process.env.XAI_API_KEY),
+  getSignal: async (symbol, when, currentPrice) => {
+    return myGetSignal(symbol, currentPrice, InferenceName.GrokInference, 'grok-beta', process.env.XAI_API_KEY);
+  },
 });
 ```
 
 </CodeGroup>
 
-All provider functions follow the same signature: `provider(fn, model, apiKey?)`.
-
 ## Supported providers
 
-| Provider | Function | Notes |
+| Provider | `InferenceName` | Notes |
 |---|---|---|
-| OpenAI | `gpt5` | GPT-4o, o3, etc. |
-| Anthropic | `claude` | Claude 3/4 series |
-| DeepSeek | `deepseek` | deepseek-chat, deepseek-reasoner |
-| Grok (xAI) | `grok` | grok-3 |
-| Mistral | `mistral` | mistral-large |
-| Perplexity | `perplexity` | sonar series |
-| Cohere | `cohere` | command-r |
-| Alibaba | `alibaba` | qwen series |
-| Hugging Face | `hf` | router API |
-| Ollama | `ollama` | local models |
-| Zhipu AI | `glm4` | GLM-4 |
+| OpenAI | `GPT5Inference` | GPT-4o, o3, etc. |
+| Anthropic | `ClaudeInference` | Claude 3/4 series |
+| DeepSeek | `DeepseekInference` | deepseek-chat, deepseek-reasoner |
+| Grok (xAI) | `GrokInference` | grok-beta |
+| Mistral | `MistralInference` | mistral-large |
+| Perplexity | `PerplexityInference` | sonar series |
+| Cohere | `CohereInference` | command-r |
+| Alibaba | `AlibabaInference` | qwen series |
+| Hugging Face | `HfInference` | router API |
+| Ollama | `OllamaInference` | local models |
+| Groq | `GroqInference` | llama, mixtral |
+| Zhipu AI | `GLM4Inference` | GLM-4 |
+
+## Signal schema
+
+Define the JSON schema once. `generateObject` validates the response against it and retries automatically on failure.
+
+```typescript
+const signalFormat = {
+  type: 'object',
+  properties: {
+    position: {
+      type: 'string',
+      description: 'Trade direction: "long" (buy) or "short" (sell)',
+      enum: ['long', 'short'],
+    },
+    note: {
+      type: 'string',
+      description: 'Human-readable description of signal reason',
+    },
+    price_open: {
+      type: 'number',
+      description: 'Entry price in USD. Omit to open at current market price',
+    },
+    take_profit_price: {
+      type: 'number',
+      description: 'Take profit price in USD. Must be above price_open for long, below for short',
+    },
+    stop_loss_price: {
+      type: 'number',
+      description: 'Stop-loss price in USD. Must be below price_open for long, above for short',
+    },
+    minute_estimated_time: {
+      type: 'number',
+      description: 'Expected trade duration in minutes before time_expired',
+    },
+    cost: {
+      type: 'number',
+      description: 'Entry cost in USD',
+    },
+    description: {
+      type: 'string',
+      description: 'User-friendly explanation of risks, min 10 sentences',
+    },
+    reasoning: {
+      type: 'string',
+      description: 'Technical analysis, min 15 sentences',
+    },
+  },
+  required: [
+    'position',
+    'note',
+    'take_profit_price',
+    'stop_loss_price',
+    'minute_estimated_time',
+    'cost',
+    'description',
+    'reasoning',
+  ],
+} as const;
+```
 
 ## Build a multi-timeframe LLM strategy
 
-Use `getCandles` inside `getSignal` to fetch data at multiple timeframes. Pass the candle arrays to your LLM wrapper alongside any other indicators. The `uuid` from each call links the agent answer and signal record together for later RAG retrieval.
+Use `getCandles` inside `getSignal` to fetch data at multiple timeframes. Pass the candle arrays to `generateObject` alongside any other indicators.
 
 ```typescript
 import { v4 as uuid } from 'uuid';
 import { addStrategySchema, getCandles, Dump } from 'backtest-kit';
-import { deepseek } from '@backtest-kit/ollama';
+import { generateObject, InferenceName } from 'json-inference';
+import type { ISignalDto } from 'backtest-kit';
 
-async function myGetSignal(symbol: string) {
+async function myGetSignal(
+  symbol: string,
+  currentPrice: number,
+  provider: InferenceName,
+  model: string,
+  apiKey?: string,
+): Promise<ISignalDto | null> {
   // Fetch candles at four timeframes
   const candles1h  = await getCandles(symbol, '1h', 24);
   const candles15m = await getCandles(symbol, '15m', 48);
   const candles5m  = await getCandles(symbol, '5m', 60);
   const candles1m  = await getCandles(symbol, '1m', 60);
 
-  // Format into message history for the LLM
-  const messages = buildMessages(symbol, { candles1h, candles15m, candles5m, candles1m });
+  const messages = [
+    {
+      role: 'system' as const,
+      content: [
+        `You are a professional trading analyst for ${symbol}.`,
+        `Current price: ${currentPrice} USD.`,
+        `Analyze the provided candle data and return a structured trade signal.`,
+      ].join('\n'),
+    },
+    {
+      role: 'user' as const,
+      content: JSON.stringify({
+        symbol,
+        currentPrice,
+        candles1h:  candles1h.slice(-5),
+        candles15m: candles15m.slice(-5),
+        candles5m:  candles5m.slice(-5),
+        candles1m:  candles1m.slice(-5),
+      }),
+    },
+  ];
+
+  const raw = await generateObject(
+    provider,
+    { format: signalFormat, messages },
+    model,
+    apiKey,
+  );
+
+  if (raw.position !== 'long' && raw.position !== 'short') {
+    return null;
+  }
 
   const resultId = uuid();
-  const signal = await callLLM(messages); // returns structured JSON
 
   // Persist the full conversation for RAG retrieval
   Dump.dumpAgentAnswer(messages, {
     dumpId: 'position-context',
     bucketName: 'multi-timeframe-strategy',
     signalId: resultId,
-    description: signal.description, // BM25 index keywords
+    description: raw.description,
   });
 
   // Persist the parsed signal record
-  Dump.dumpRecord(signal, {
+  Dump.dumpRecord(raw, {
     dumpId: 'position-entry',
     bucketName: 'multi-timeframe-strategy',
     signalId: resultId,
-    description: signal.description,
+    description: raw.reasoning,
   });
 
-  return { ...signal, id: resultId };
+  return {
+    position: raw.position,
+    note: raw.note,
+    priceOpen: raw.price_open,
+    priceTakeProfit: raw.take_profit_price,
+    priceStopLoss: raw.stop_loss_price,
+    minuteEstimatedTime: raw.minute_estimated_time,
+    cost: raw.cost,
+  };
 }
 
 addStrategySchema({
   strategyName: 'llm-strategy',
   interval: '5m',
   riskName: 'demo',
-  getSignal: deepseek(myGetSignal, 'deepseek-chat', process.env.DEEPSEEK_API_KEY),
+  getSignal: async (symbol, when, currentPrice) =>
+    myGetSignal(symbol, currentPrice, InferenceName.DeepseekInference, 'deepseek-chat', process.env.DEEPSEEK_API_KEY),
 });
 ```
 
@@ -169,11 +284,11 @@ Dump.dumpAgentAnswer(messages, {
 });
 
 // Save the signal record
-Dump.dumpRecord(signal, {
+Dump.dumpRecord(raw, {
   dumpId: 'signal-output',
   bucketName: 'my-strategy',
   signalId: resultId,
-  description: signal.note,
+  description: raw.reasoning,
 });
 ```
 
@@ -194,7 +309,7 @@ Memory.enable();
 // Inside getSignal — write the current analysis
 await Memory.writeMemory({
   memoryId: resultId,
-  value: { symbol, signal, timestamp: Date.now() },
+  value: { symbol, raw, timestamp: Date.now() },
   signalId: currentSignalId,
   bucketName: 'trade-history',
   description: 'BTC long entry with R/R 3:1 after bullish engulfing on 1h',

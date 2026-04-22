@@ -1,0 +1,397 @@
+---
+title: "json-inference: LLM inference for trading strategies"
+description: "Unified API for 12 LLM providers. Call generateObject() to get structured, schema-validated JSON from any provider — OpenAI, Claude, DeepSeek, Groq, or local Ollama."
+---
+
+`json-inference` gives you a single, consistent API for integrating large language models into trading strategies. Instead of wiring up provider SDKs, authentication, and JSON parsing yourself, you call one `generateObject()` function with your schema — and get back typed, validated JSON across 12 providers.
+
+## Installation
+
+```bash
+npm install json-inference openai ollama groq-sdk backtest-kit
+```
+
+All three SDK peer dependencies are required:
+
+| Package | Providers |
+|---------|-----------|
+| `openai` | OpenAI, Claude, DeepSeek, Mistral, Perplexity, Cohere, GLM-4 |
+| `ollama` | Ollama |
+| `groq-sdk` | Groq |
+
+## Supported providers
+
+| Provider | `InferenceName` | Strategy |
+|----------|----------------|----------|
+| OpenAI | `GPT5Inference` | response_format |
+| Claude | `ClaudeInference` | tool-calling |
+| DeepSeek | `DeepseekInference` | tool-calling |
+| Grok | `GrokInference` | response_format |
+| Mistral | `MistralInference` | tool-calling |
+| Perplexity | `PerplexityInference` | response_format |
+| Cohere | `CohereInference` | response_format |
+| Alibaba | `AlibabaInference` | tool-calling |
+| Hugging Face | `HfInference` | tool-calling |
+| Ollama | `OllamaInference` | tool-calling |
+| GLM-4 | `GLM4Inference` | response_format |
+| Groq | `GroqInference` | tool-calling |
+
+## Signal schema
+
+Every `getSignal` call returns an `ISignalDto`. The JSON schema passed to `generateObject` must map to its required fields. Use this schema:
+
+```typescript
+const signalFormat = {
+  type: 'object',
+  properties: {
+    position: {
+      type: 'string',
+      description: 'Trade direction: "long" (buy) or "short" (sell)',
+      enum: ['long', 'short'],
+    },
+    note: {
+      type: 'string',
+      description: 'Human-readable description of signal reason',
+    },
+    price_open: {
+      type: 'number',
+      description: 'Entry price in USD. Omit to open at current market price',
+    },
+    take_profit_price: {
+      type: 'number',
+      description: 'Take profit price in USD. Must be above price_open for long, below for short',
+    },
+    stop_loss_price: {
+      type: 'number',
+      description: 'Stop-loss price in USD. Must be below price_open for long, above for short',
+    },
+    minute_estimated_time: {
+      type: 'number',
+      description: 'Expected trade duration in minutes before time_expired',
+    },
+    cost: {
+      type: 'number',
+      description: 'Entry cost in USD',
+    },
+    description: {
+      type: 'string',
+      description: 'User-friendly explanation of risks, min 10 sentences',
+    },
+    reasoning: {
+      type: 'string',
+      description: 'Technical analysis, min 15 sentences',
+    },
+  },
+  required: [
+    'position',
+    'note',
+    'take_profit_price',
+    'stop_loss_price',
+    'minute_estimated_time',
+    'cost',
+    'description',
+    'reasoning',
+  ],
+};
+```
+
+Map the LLM output back to `ISignalDto`:
+
+```typescript
+import type { ISignalDto } from 'backtest-kit';
+
+function toSignalDto(raw: typeof result): ISignalDto {
+  return {
+    position: raw.position as 'long' | 'short',
+    note: raw.note,
+    priceOpen: raw.price_open,
+    priceTakeProfit: raw.take_profit_price,
+    priceStopLoss: raw.stop_loss_price,
+    minuteEstimatedTime: raw.minute_estimated_time,
+    cost: raw.cost,
+  };
+}
+```
+
+## Calling a provider from `getSignal`
+
+Call `generateObject` inside `getSignal`. Change `InferenceName` to switch providers — schema and messages stay the same:
+
+<CodeGroup>
+
+```typescript DeepSeek
+import { generateObject, InferenceName } from 'json-inference';
+import { addStrategySchema, getCandles } from 'backtest-kit';
+
+addStrategySchema({
+  strategyName: 'deepseek-strategy',
+  interval: '5m',
+  getSignal: async (symbol, when, currentPrice) => {
+    const candles = await getCandles(symbol, '15m', 48);
+
+    const messages = [
+      {
+        role: 'system' as const,
+        content: `You are a trading analyst. Current price: ${currentPrice}`,
+      },
+      {
+        role: 'user' as const,
+        content: `Analyze ${symbol} and provide a trade signal. Last close: ${candles.at(-1)?.close}`,
+      },
+    ];
+
+    const raw = await generateObject(
+      InferenceName.DeepseekInference,
+      { format: signalFormat, messages },
+      'deepseek-chat',
+      process.env.DEEPSEEK_API_KEY,
+    );
+
+    if (raw.position === 'long' || raw.position === 'short') {
+      return toSignalDto(raw);
+    }
+    return null;
+  },
+});
+```
+
+```typescript OpenAI
+import { generateObject, InferenceName } from 'json-inference';
+import { addStrategySchema, getCandles } from 'backtest-kit';
+
+addStrategySchema({
+  strategyName: 'gpt-strategy',
+  interval: '5m',
+  getSignal: async (symbol, when, currentPrice) => {
+    const candles = await getCandles(symbol, '15m', 48);
+
+    const messages = [
+      {
+        role: 'system' as const,
+        content: `You are a trading analyst. Current price: ${currentPrice}`,
+      },
+      {
+        role: 'user' as const,
+        content: `Analyze ${symbol} and provide a trade signal. Last close: ${candles.at(-1)?.close}`,
+      },
+    ];
+
+    const raw = await generateObject(
+      InferenceName.GPT5Inference,
+      { format: signalFormat, messages },
+      'gpt-4o',
+      process.env.OPENAI_API_KEY,
+    );
+
+    if (raw.position === 'long' || raw.position === 'short') {
+      return toSignalDto(raw);
+    }
+    return null;
+  },
+});
+```
+
+```typescript Claude
+import { generateObject, InferenceName } from 'json-inference';
+import { addStrategySchema, getCandles } from 'backtest-kit';
+
+addStrategySchema({
+  strategyName: 'claude-strategy',
+  interval: '5m',
+  getSignal: async (symbol, when, currentPrice) => {
+    const candles = await getCandles(symbol, '15m', 48);
+
+    const messages = [
+      {
+        role: 'system' as const,
+        content: `You are a trading analyst. Current price: ${currentPrice}`,
+      },
+      {
+        role: 'user' as const,
+        content: `Analyze ${symbol} and provide a trade signal. Last close: ${candles.at(-1)?.close}`,
+      },
+    ];
+
+    const raw = await generateObject(
+      InferenceName.ClaudeInference,
+      { format: signalFormat, messages },
+      'claude-opus-4-5',
+      process.env.ANTHROPIC_API_KEY,
+    );
+
+    if (raw.position === 'long' || raw.position === 'short') {
+      return toSignalDto(raw);
+    }
+    return null;
+  },
+});
+```
+
+```typescript Ollama (local)
+import { generateObject, InferenceName } from 'json-inference';
+import { addStrategySchema, getCandles } from 'backtest-kit';
+
+addStrategySchema({
+  strategyName: 'ollama-strategy',
+  interval: '5m',
+  getSignal: async (symbol, when, currentPrice) => {
+    const candles = await getCandles(symbol, '15m', 48);
+
+    const messages = [
+      {
+        role: 'system' as const,
+        content: `You are a trading analyst. Current price: ${currentPrice}`,
+      },
+      {
+        role: 'user' as const,
+        content: `Analyze ${symbol} and provide a trade signal. Last close: ${candles.at(-1)?.close}`,
+      },
+    ];
+
+    // apiKey is optional for local Ollama
+    const raw = await generateObject(
+      InferenceName.OllamaInference,
+      { format: signalFormat, messages },
+      'llama3.3:70b',
+    );
+
+    if (raw.position === 'long' || raw.position === 'short') {
+      return toSignalDto(raw);
+    }
+    return null;
+  },
+});
+```
+
+```typescript Groq
+import { generateObject, InferenceName } from 'json-inference';
+import { addStrategySchema, getCandles } from 'backtest-kit';
+
+addStrategySchema({
+  strategyName: 'groq-strategy',
+  interval: '5m',
+  getSignal: async (symbol, when, currentPrice) => {
+    const candles = await getCandles(symbol, '15m', 48);
+
+    const messages = [
+      {
+        role: 'system' as const,
+        content: `You are a trading analyst. Current price: ${currentPrice}`,
+      },
+      {
+        role: 'user' as const,
+        content: `Analyze ${symbol} and provide a trade signal. Last close: ${candles.at(-1)?.close}`,
+      },
+    ];
+
+    const raw = await generateObject(
+      InferenceName.GroqInference,
+      { format: signalFormat, messages },
+      'llama-3.3-70b-versatile',
+      process.env.GROQ_API_KEY,
+    );
+
+    if (raw.position === 'long' || raw.position === 'short') {
+      return toSignalDto(raw);
+    }
+    return null;
+  },
+});
+```
+
+</CodeGroup>
+
+## Switching providers
+
+Change one argument to switch between providers. The schema and messages stay the same:
+
+```typescript
+import { generateObject, InferenceName } from 'json-inference';
+
+// OpenAI
+await generateObject(InferenceName.GPT5Inference, params, 'gpt-4o', OPENAI_KEY);
+
+// Claude
+await generateObject(InferenceName.ClaudeInference, params, 'claude-opus-4-5', CLAUDE_KEY);
+
+// DeepSeek
+await generateObject(InferenceName.DeepseekInference, params, 'deepseek-chat', DEEPSEEK_KEY);
+
+// Ollama (local, no key)
+await generateObject(InferenceName.OllamaInference, params, 'llama3.3:70b');
+
+// Groq
+await generateObject(InferenceName.GroqInference, params, 'llama-3.3-70b-versatile', GROQ_KEY);
+```
+
+## API reference
+
+### `generateObject`
+
+```typescript
+function generateObject<F extends FormatModel>(
+  inferenceName: InferenceName,
+  params: IOutlineParams<F>,
+  model: string,
+  apiKey?: string,
+): Promise<InferFormat<F>>
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `inferenceName` | `InferenceName` | Provider to use |
+| `params.format` | `FormatModel` | JSON schema describing the output shape |
+| `params.messages` | `MessageModel[]` | Conversation history |
+| `model` | `string` | Model name (`"gpt-4o"`, `"deepseek-chat"`, etc.) |
+| `apiKey` | `string` | API key — optional for local Ollama |
+
+### `FormatModel`
+
+```typescript
+interface FormatModel {
+  type: string;
+  required: string[];
+  properties: {
+    [key: string]: FormatProperty;
+  };
+}
+
+type FormatProperty =
+  | { type: 'string'; description: string; enum?: string[] }
+  | { type: 'number'; description: string }
+  | { type: 'integer'; description: string }
+  | { type: 'boolean'; description: string }
+  | { type: 'array'; description: string }
+  | { type: 'object'; description: string };
+```
+
+### `MessageModel`
+
+```typescript
+interface MessageModel {
+  role: 'assistant' | 'system' | 'user';
+  content: string;
+}
+```
+
+### `InferFormat<T>`
+
+Return types are automatically inferred from the `format` schema:
+
+| Schema `type` | TypeScript type |
+|---------------|-----------------|
+| `"string"` | `string` |
+| `"number"` | `number` |
+| `"integer"` | `number` |
+| `"boolean"` | `boolean` |
+| `"array"` | `any[]` |
+| `"object"` | `Record<string, any>` |
+
+### Exports
+
+```typescript
+export { generateObject } from 'json-inference';
+export { InferenceName } from 'json-inference';
+export { IOutlineParams } from 'json-inference';
+export { FormatModel, FormatProperty, InferFormat } from 'json-inference';
+```
