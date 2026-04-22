@@ -30,7 +30,6 @@ The `skills/backtest-kit/` folder (installed under `~/.claude/skills/backtest-ki
 - **Strategy generation** — complete TypeScript files with all schema registrations and runner setup
 - **Debugging help** — catches common mistakes (missing `await`, wrong TP/SL direction, top-level commit calls)
 - **API reference** — all schemas, commit functions, event listeners, LLM integration, graph pipelines, and persistence adapters
-- **Baseline recommendation** — always points to the `example/` folder when something isn't working
 
 ### Skill structure
 
