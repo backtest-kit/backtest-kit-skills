@@ -18,7 +18,7 @@
 > **Save your tokens:** Clone the [reference implementation](https://github.com/tripolskypetr/backtest-kit/tree/master/example) — a fully working AI trading system with LLM forecasting, multi-timeframe data, and a documented February 2026 backtest.
 
 ```bash
-npx skills add https://github.com/tripolskypetr/backtest-kit-skills
+npx skills add https://github.com/backtest-kit/backtest-kit-skills
 ```
 
 ---
