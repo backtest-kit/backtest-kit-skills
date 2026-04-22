@@ -13,6 +13,16 @@
 
 ---
 
+## 🚀 Installation
+
+> **Save your tokens:** Clone the [reference implementation](https://github.com/tripolskypetr/backtest-kit/tree/master/example) — a fully working AI trading system with LLM forecasting, multi-timeframe data, and a documented February 2026 backtest.
+
+```bash
+npx skills add https://github.com/tripolskypetr/backtest-kit-skills
+```
+
+---
+
 ## 🤖 Claude Code Skill
 
 The `skills/backtest-kit/` folder (installed under `~/.claude/skills/backtest-kit/`) is a Claude Code agent skill that provides:
