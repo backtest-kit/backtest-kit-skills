@@ -1,0 +1,227 @@
+---
+title: "Step-by-step: run your first Backtest Kit simulation"
+description: "End-to-end walkthrough: register an exchange, frame, risk profile, and strategy, then run a backtest and generate a performance report with Backtest Kit."
+---
+
+Backtest Kit processes historical data as an async stream of time, calling your strategy at each candle interval and simulating TP/SL conditions with VWAP pricing. This guide walks you through every step — from wiring up the exchange adapter to reading the final report.
+
+<Steps>
+
+<Step title="Install dependencies">
+
+```bash
+npm install backtest-kit ccxt uuid
+```
+
+</Step>
+
+<Step title="Configure logging and global settings">
+
+Call `setLogger` and `setConfig` once at process startup, before registering any schemas.
+
+```typescript
+import { setLogger, setConfig } from 'backtest-kit';
+
+setLogger({
+  log: console.log,
+  debug: console.debug,
+  info: console.info,
+  warn: console.warn,
+});
+
+setConfig({
+  CC_PERCENT_SLIPPAGE: 0.1,  // % slippage per transaction
+  CC_PERCENT_FEE: 0.1,       // % fee per transaction
+  CC_SCHEDULE_AWAIT_MINUTES: 120,  // pending signal timeout
+});
+```
+
+</Step>
+
+<Step title="Register an exchange schema">
+
+The exchange schema defines how Backtest Kit fetches candle data. Use any CCXT-compatible exchange — the adapter is stateless and can be reused across strategies.
+
+```typescript
+import ccxt from 'ccxt';
+import { addExchangeSchema } from 'backtest-kit';
+
+addExchangeSchema({
+  exchangeName: 'binance',
+  getCandles: async (symbol, interval, since, limit) => {
+    const exchange = new ccxt.binance();
+    const ohlcv = await exchange.fetchOHLCV(
+      symbol,
+      interval,
+      since.getTime(),
+      limit
+    );
+    return ohlcv.map(([timestamp, open, high, low, close, volume]) => ({
+      timestamp, open, high, low, close, volume,
+    }));
+  },
+  formatPrice: (symbol, price) => price.toFixed(2),
+  formatQuantity: (symbol, quantity) => quantity.toFixed(8),
+});
+```
+
+</Step>
+
+<Step title="Register a time frame">
+
+A frame schema defines the date range and candle interval the backtest iterates over.
+
+```typescript
+import { addFrameSchema } from 'backtest-kit';
+
+addFrameSchema({
+  frameName: '1d-test',
+  interval: '1m',
+  startDate: new Date('2025-12-01'),
+  endDate: new Date('2025-12-02'),
+});
+```
+
+</Step>
+
+<Step title="Register a risk profile">
+
+Risk validations run before every signal is accepted. Throw an error to reject a signal silently — the framework logs the rejection and continues.
+
+```typescript
+import { addRiskSchema } from 'backtest-kit';
+
+addRiskSchema({
+  riskName: 'demo',
+  validations: [
+    // TP must be at least 1% away from entry
+    ({ pendingSignal, currentPrice }) => {
+      const { priceOpen = currentPrice, priceTakeProfit, position } = pendingSignal;
+      const tpDistance = position === 'long'
+        ? ((priceTakeProfit - priceOpen) / priceOpen) * 100
+        : ((priceOpen - priceTakeProfit) / priceOpen) * 100;
+      if (tpDistance < 1) {
+        throw new Error(`TP too close: ${tpDistance.toFixed(2)}%`);
+      }
+    },
+    // Reward-to-risk ratio must be at least 2:1
+    ({ pendingSignal, currentPrice }) => {
+      const { priceOpen = currentPrice, priceTakeProfit, priceStopLoss, position } = pendingSignal;
+      const reward = position === 'long'
+        ? priceTakeProfit - priceOpen
+        : priceOpen - priceTakeProfit;
+      const risk = position === 'long'
+        ? priceOpen - priceStopLoss
+        : priceStopLoss - priceOpen;
+      if (reward / risk < 2) {
+        throw new Error('Poor R/R ratio');
+      }
+    },
+  ],
+});
+```
+
+</Step>
+
+<Step title="Register a strategy">
+
+The `getSignal` function is called at the configured interval. Return `null` to skip a candle, or return a signal DTO to open a position. Use `getCandles` inside `getSignal` to access multi-timeframe data from the exchange you registered.
+
+```typescript
+import { addStrategySchema, getCandles } from 'backtest-kit';
+
+addStrategySchema({
+  strategyName: 'my-strategy',
+  interval: '5m',
+  riskName: 'demo',
+  getSignal: async (symbol, when, currentPrice) => {
+    const candles1h  = await getCandles(symbol, '1h', 24);
+    const candles15m = await getCandles(symbol, '15m', 48);
+    const candles5m  = await getCandles(symbol, '5m', 60);
+
+    // Your signal logic here — return null to skip
+    // Return a signal DTO to open a position:
+    return {
+      position: 'long',
+      priceTakeProfit: currentPrice * 1.03,
+      priceStopLoss: currentPrice * 0.985,
+      minuteEstimatedTime: 240,
+    };
+  },
+});
+```
+
+</Step>
+
+<Step title="Run the backtest">
+
+`Backtest.background` starts the backtest in the background and returns a stop function. Use `listenSignalBacktest` to observe every closed signal in real time, and `listenDoneBacktest` to generate the report when the run completes.
+
+```typescript
+import {
+  Backtest,
+  listenSignalBacktest,
+  listenDoneBacktest,
+  listenBacktestProgress,
+} from 'backtest-kit';
+
+Backtest.background('BTCUSDT', {
+  strategyName: 'my-strategy',
+  exchangeName: 'binance',
+  frameName: '1d-test',
+});
+
+listenSignalBacktest((event) => {
+  if (event.action === 'closed') {
+    console.log(event.closeReason, event.pnl.pnlPercentage.toFixed(2) + '%');
+  }
+});
+
+listenBacktestProgress((event) => {
+  console.log(`Progress: ${(event.progress * 100).toFixed(1)}%`);
+});
+
+listenDoneBacktest(async (event) => {
+  console.log('Done:', event.symbol);
+  // Write a Markdown report to ./logs/backtest/
+  await Backtest.dump(event.symbol, {
+    strategyName: event.strategyName,
+    exchangeName: event.exchangeName,
+    frameName: event.frameName,
+  });
+});
+```
+
+</Step>
+
+</Steps>
+
+## Accessing results programmatically
+
+`Backtest.getData` returns the aggregated statistics without writing a file.
+
+```typescript
+const stats = await Backtest.getData('my-strategy');
+console.log('Total signals:', stats.totalEvents);
+console.log('Win rate:', stats.winRate);
+console.log('Avg PNL:', stats.avgPnl);
+```
+
+<Note>
+Reports accumulate in memory until `Backtest.clear('my-strategy')` is called or the process exits. Call `clear` between multiple sequential backtests on the same strategy name to avoid mixing results.
+</Note>
+
+## Iterating results with an async generator
+
+For fine-grained control — such as early termination or custom accumulation — use `Backtest.run` directly:
+
+```typescript
+for await (const result of Backtest.run('BTCUSDT', {
+  strategyName: 'my-strategy',
+  exchangeName: 'binance',
+  frameName: '1d-test',
+})) {
+  console.log(result.action, result.pnl.pnlPercentage);
+  if (shouldStop) break; // safe early termination
+}
+```

@@ -1,0 +1,549 @@
+---
+title: "Event listeners: react to signal and trading events"
+description: "Subscribe to signal lifecycle, position milestones, timing pings, performance metrics, and sync events. Every listener returns an unsubscribe function."
+---
+
+Event listeners are the reactive layer of Backtest Kit. You register them once at startup and they fire automatically as the engine processes each tick. Every listener wraps its callback in a queued executor, which ensures that even async callbacks are processed one at a time in arrival order — preventing race conditions between concurrent ticks.
+
+Every listener function returns an unsubscribe function. Call it to remove the listener when it is no longer needed.
+
+```typescript
+const unsubscribe = listenSignal((event) => { /* ... */ });
+// Later:
+unsubscribe();
+```
+
+---
+
+## Signal events
+
+Signal events fire on every signal state transition — idle, opened, active, and closed — across both backtest and live runs.
+
+### `listenSignal(fn)`
+
+Subscribes to all signal events from both backtest and live execution.
+
+```typescript
+import { listenSignal } from "backtest-kit";
+
+const unsubscribe = listenSignal((event) => {
+  if (event.action === "opened") {
+    console.log("New signal opened:", event.signal.id);
+  } else if (event.action === "closed") {
+    console.log("Signal closed. PNL:", event.pnl.pnlPercentage);
+  }
+});
+```
+
+<ParamField path="fn" type="(event: IStrategyTickResult) => void" required>
+  Callback receiving the full strategy tick result.
+</ParamField>
+
+---
+
+### `listenSignalBacktest(fn)`
+
+Subscribes only to signal events from `Backtest.run()` or `Backtest.background()` execution. Live events are not received.
+
+```typescript
+import { listenSignalBacktest } from "backtest-kit";
+
+listenSignalBacktest((event) => {
+  if (event.action === "closed") {
+    console.log("Backtest PNL:", event.pnl.pnlPercentage);
+  }
+});
+```
+
+---
+
+### `listenSignalLive(fn)`
+
+Subscribes only to signal events from `Live.run()` or `Live.background()` execution.
+
+```typescript
+import { listenSignalLive } from "backtest-kit";
+
+listenSignalLive((event) => {
+  console.log("Live event:", event.action);
+});
+```
+
+---
+
+### `listenSignalOnce(filterFn, fn)`
+
+Subscribes to all signal events, executes the callback exactly once for the first event matching `filterFn`, then automatically unsubscribes.
+
+```typescript
+import { listenSignalOnce } from "backtest-kit";
+
+listenSignalOnce(
+  (event) => event.action === "closed" && event.closeReason === "take_profit",
+  (event) => console.log("First TP hit. PNL:", event.pnl.pnlPercentage)
+);
+```
+
+<ParamField path="filterFn" type="(event: IStrategyTickResult) => boolean" required>
+  Predicate that determines which event triggers the callback.
+</ParamField>
+
+<ParamField path="fn" type="(event: IStrategyTickResult) => void" required>
+  Callback executed once when the filter matches.
+</ParamField>
+
+---
+
+### `listenSignalBacktestOnce(filterFn, fn)`
+
+One-time variant of `listenSignalBacktest`.
+
+```typescript
+import { listenSignalBacktestOnce } from "backtest-kit";
+
+listenSignalBacktestOnce(
+  (event) => event.action === "closed" && event.closeReason === "stop_loss",
+  (event) => console.log("First backtest SL hit")
+);
+```
+
+---
+
+### `listenSignalLiveOnce(filterFn, fn)`
+
+One-time variant of `listenSignalLive`.
+
+```typescript
+import { listenSignalLiveOnce } from "backtest-kit";
+
+listenSignalLiveOnce(
+  (event) => event.action === "closed",
+  (event) => console.log("First live signal closed")
+);
+```
+
+---
+
+## Lifecycle events
+
+Lifecycle events fire when a background runner completes or reports progress.
+
+### `listenDoneBacktest(fn)`
+
+Fires when `Backtest.background()` finishes processing all frames for a given symbol and strategy.
+
+```typescript
+import { listenDoneBacktest, Backtest } from "backtest-kit";
+
+listenDoneBacktest(async (event) => {
+  console.log("Backtest done:", event.strategyName, event.symbol);
+  await Backtest.dump(event.symbol, event.strategyName);
+});
+```
+
+<ParamField path="fn" type="(event: DoneContract) => void" required>
+  Callback receiving `{ strategyName, exchangeName, symbol, frameName }`.
+</ParamField>
+
+---
+
+### `listenDoneLive(fn)`
+
+Fires when `Live.background()` terminates.
+
+```typescript
+import { listenDoneLive } from "backtest-kit";
+
+listenDoneLive((event) => {
+  console.log("Live session ended:", event.strategyName);
+});
+```
+
+---
+
+### `listenDoneWalker(fn)`
+
+Fires when `Walker.background()` finishes.
+
+```typescript
+import { listenDoneWalker } from "backtest-kit";
+
+listenDoneWalker((event) => {
+  console.log("Walker done:", event.symbol);
+});
+```
+
+---
+
+### `listenBacktestProgress(fn)`
+
+Reports progress during `Backtest.background()` execution.
+
+```typescript
+import { listenBacktestProgress } from "backtest-kit";
+
+listenBacktestProgress((event) => {
+  const pct = (event.progress * 100).toFixed(1);
+  console.log(`${pct}% — ${event.processedFrames}/${event.totalFrames} frames`);
+});
+```
+
+<ParamField path="fn" type="(event: ProgressBacktestContract) => void" required>
+  Callback with `{ progress, processedFrames, totalFrames, strategyName, symbol }`.
+</ParamField>
+
+---
+
+## Position events
+
+Position events fire when an open position crosses a profit or loss milestone, or when the breakeven threshold is reached. Each event includes the current price and the strategy/exchange context needed to call commit functions.
+
+### `listenPartialProfitAvailable(fn)`
+
+Fires when a signal's price reaches a profit milestone level (10%, 20%, 30%, etc.). Only fires when a pending signal still exists at the time of the event.
+
+```typescript
+import { listenPartialProfitAvailable, commitPartialProfit } from "backtest-kit";
+
+listenPartialProfitAvailable(async (event) => {
+  // Close 30% whenever price hits a 30% profit level
+  if (event.level === 30) {
+    await commitPartialProfit(event.symbol, 30);
+  }
+});
+```
+
+<ParamField path="fn" type="(event: PartialProfitContract) => void" required>
+  Callback with `{ symbol, level, currentPrice, backtest, strategyName, exchangeName, frameName, data }`.
+</ParamField>
+
+---
+
+### `listenPartialLossAvailable(fn)`
+
+Fires when a signal's price crosses a loss milestone level. Only fires when a pending signal still exists.
+
+```typescript
+import { listenPartialLossAvailable, commitPartialLoss } from "backtest-kit";
+
+listenPartialLossAvailable(async (event) => {
+  if (event.level === 10) {
+    await commitPartialLoss(event.symbol, 20);
+  }
+});
+```
+
+---
+
+### `listenBreakevenAvailable(fn)`
+
+Fires when a signal's price has moved far enough in the profit direction to cover transaction costs, making a zero-risk (breakeven) stop-loss move valid.
+
+```typescript
+import { listenBreakevenAvailable, commitBreakeven } from "backtest-kit";
+
+listenBreakevenAvailable(async (event) => {
+  await commitBreakeven(event.symbol);
+});
+```
+
+<ParamField path="fn" type="(event: BreakevenContract) => void" required>
+  Callback with signal context and current price.
+</ParamField>
+
+---
+
+## Trading events
+
+### `listenRisk(fn)`
+
+Fires when a signal is **rejected** by a risk validation rule. Does not fire for allowed signals.
+
+```typescript
+import { listenRisk } from "backtest-kit";
+
+listenRisk((event) => {
+  console.log(`[RISK REJECTED] ${event.symbol} — ${event.comment}`);
+  console.log("Active positions:", event.activePositionCount);
+});
+```
+
+<ParamField path="fn" type="(event: RiskContract) => void" required>
+  Callback with `{ symbol, strategyName, pendingSignal, activePositionCount, comment, currentPrice }`.
+</ParamField>
+
+---
+
+### `listenError(fn)`
+
+Fires on recoverable errors during strategy execution (e.g. failed API calls). Execution continues after the error.
+
+```typescript
+import { listenError } from "backtest-kit";
+
+listenError((error) => {
+  console.error("Recoverable error:", error.message);
+});
+```
+
+---
+
+### `listenExit(fn)`
+
+Fires on fatal errors that terminate the current background runner. Unlike `listenError`, these errors stop execution.
+
+```typescript
+import { listenExit } from "backtest-kit";
+
+listenExit((error) => {
+  console.error("Fatal error — runner terminated:", error.message);
+  // restart process, send alert, etc.
+});
+```
+
+---
+
+### `listenStrategyCommit(fn)`
+
+Fires when any strategy management action executes: `cancel-scheduled`, `close-pending`, `partial-profit`, `partial-loss`, `trailing-stop`, `trailing-take`, `breakeven`, `activate-scheduled`, or `average-buy`.
+
+```typescript
+import { listenStrategyCommit } from "backtest-kit";
+
+listenStrategyCommit((event) => {
+  console.log(`[${event.action}] ${event.symbol}`);
+  if (event.action === "partial-profit") {
+    console.log(`Closed ${event.percentToClose}% at ${event.currentPrice}`);
+  }
+});
+```
+
+<ParamField path="fn" type="(event: StrategyCommitContract) => void" required>
+  Callback with `{ action, symbol, strategyName, exchangeName, frameName, backtest, ... }`.
+</ParamField>
+
+---
+
+## Timing events
+
+Timing events fire periodically while a signal is in a particular state, giving you a heartbeat to implement time-based management logic.
+
+### `listenSchedulePing(fn)`
+
+Fires every minute while a scheduled signal is being monitored (waiting for price to reach `priceOpen`). Only fires when a scheduled signal still exists.
+
+```typescript
+import { listenSchedulePing } from "backtest-kit";
+
+listenSchedulePing((event) => {
+  const ts = new Date(event.timestamp).toISOString();
+  console.log(`Schedule ping for ${event.symbol} at ${ts}`);
+});
+```
+
+<ParamField path="fn" type="(event: SchedulePingContract) => void" required>
+  Callback with `{ symbol, timestamp, backtest, data }`.
+</ParamField>
+
+---
+
+### `listenActivePing(fn)`
+
+Fires every minute while a pending signal (open position) is active. Only fires when a pending signal still exists.
+
+```typescript
+import { listenActivePing, commitTrailingStopCost } from "backtest-kit";
+
+listenActivePing(async (event) => {
+  // Dynamic trailing stop management every minute
+  const newSL = event.data.priceOpen * 0.98;
+  await commitTrailingStopCost(event.symbol, newSL);
+});
+```
+
+<ParamField path="fn" type="(event: ActivePingContract) => void" required>
+  Callback with `{ symbol, timestamp, backtest, data }` where `data` is the pending signal.
+</ParamField>
+
+---
+
+### `listenIdlePing(fn)`
+
+Fires every tick when there is no pending or scheduled signal active — i.e. the strategy is idle.
+
+```typescript
+import { listenIdlePing } from "backtest-kit";
+
+listenIdlePing((event) => {
+  console.log("Strategy idle at", event.timestamp);
+});
+```
+
+<ParamField path="fn" type="(event: IdlePingContract) => void" required>
+  Callback with `{ symbol, timestamp, backtest, strategyName, exchangeName, frameName }`.
+</ParamField>
+
+---
+
+## Performance events
+
+### `listenPerformance(fn)`
+
+Fires during strategy execution to report timing metrics for individual operations. Use this to identify slow callbacks or bottlenecks.
+
+```typescript
+import { listenPerformance } from "backtest-kit";
+
+listenPerformance((event) => {
+  if (event.duration > 100) {
+    console.warn("Slow operation:", event.metricType, `${event.duration.toFixed(1)}ms`);
+  }
+});
+```
+
+<ParamField path="fn" type="(event: PerformanceContract) => void" required>
+  Callback with `{ metricType, duration }`.
+</ParamField>
+
+---
+
+### `listenWalkerProgress(fn)`
+
+Fires after each strategy is tested during a Walker run.
+
+```typescript
+import { listenWalkerProgress } from "backtest-kit";
+
+listenWalkerProgress((event) => {
+  const pct = (event.progress * 100).toFixed(1);
+  console.log(`Walker ${pct}% — ${event.processedStrategies}/${event.totalStrategies}`);
+});
+```
+
+---
+
+### `listenWalkerComplete(fn)`
+
+Fires once when a Walker run finishes testing all strategies.
+
+```typescript
+import { listenWalkerComplete } from "backtest-kit";
+
+listenWalkerComplete((results) => {
+  console.log("Best strategy:", results.bestStrategy);
+  console.log(`Best ${results.metric}:`, results.bestMetric);
+});
+```
+
+<ParamField path="fn" type="(event: WalkerCompleteContract) => void" required>
+  Callback with `{ walkerName, bestStrategy, bestMetric, metric, totalStrategies }`.
+</ParamField>
+
+---
+
+## Sync events
+
+<Warning>
+  `listenSync` is intended for advanced use only. Exchange integration should be implemented via `Broker.useBrokerAdapter`. If your `listenSync` callback throws, the signal open or close will not execute. Use `listenSync` only when you need to synchronize with an external system that cannot be expressed as a broker adapter.
+</Warning>
+
+### `listenSync(fn)`
+
+Fires when a signal is being opened or closed, blocking position state mutation until the async callback resolves.
+
+```typescript
+import { listenSync } from "backtest-kit";
+
+listenSync(async (event) => {
+  // e.g. write to external audit log before state mutates
+  await auditLog.record(event);
+});
+```
+
+---
+
+### `listenHighestProfit(fn)`
+
+Fires when a signal reaches a new highest profit level during its lifecycle. Only fires when a pending signal still exists.
+
+```typescript
+import { listenHighestProfit } from "backtest-kit";
+
+listenHighestProfit((event) => {
+  console.log("New profit high:", event.highestPnlPercentage);
+});
+```
+
+---
+
+### `listenMaxDrawdown(fn)`
+
+Fires when a signal reaches a new maximum drawdown level. Only fires when a pending signal still exists.
+
+```typescript
+import { listenMaxDrawdown } from "backtest-kit";
+
+listenMaxDrawdown((event) => {
+  console.log("New max drawdown:", event.maxDrawdownPnlPercentage);
+});
+```
+
+---
+
+### `listenSignalNotify(fn)`
+
+Fires when `commitSignalNotify` is called from within a strategy callback. Use this to forward notifications to external systems such as Telegram or Slack.
+
+```typescript
+import { listenSignalNotify } from "backtest-kit";
+
+listenSignalNotify((event) => {
+  console.log("Notification:", event.notificationNote);
+  // forward to messaging service
+});
+```
+
+<ParamField path="fn" type="(event: SignalInfoContract) => void" required>
+  Callback with `{ symbol, notificationNote, notificationId, strategyName, ... }`.
+</ParamField>
+
+---
+
+## Once variants
+
+Every listener has a `Once` variant that fires exactly once for the first event matching a filter predicate, then automatically unsubscribes. The return value is an unsubscribe function you can call to cancel before the event fires.
+
+| Listener | Once variant |
+|---|---|
+| `listenSignal` | `listenSignalOnce` |
+| `listenSignalBacktest` | `listenSignalBacktestOnce` |
+| `listenSignalLive` | `listenSignalLiveOnce` |
+| `listenDoneBacktest` | `listenDoneBacktestOnce` |
+| `listenDoneLive` | `listenDoneLiveOnce` |
+| `listenDoneWalker` | `listenDoneWalkerOnce` |
+| `listenPartialProfitAvailable` | `listenPartialProfitAvailableOnce` |
+| `listenPartialLossAvailable` | `listenPartialLossAvailableOnce` |
+| `listenBreakevenAvailable` | `listenBreakevenAvailableOnce` |
+| `listenRisk` | `listenRiskOnce` |
+| `listenSchedulePing` | `listenSchedulePingOnce` |
+| `listenActivePing` | `listenActivePingOnce` |
+| `listenIdlePing` | `listenIdlePingOnce` |
+| `listenStrategyCommit` | `listenStrategyCommitOnce` |
+| `listenHighestProfit` | `listenHighestProfitOnce` |
+| `listenMaxDrawdown` | `listenMaxDrawdownOnce` |
+| `listenSignalNotify` | `listenSignalNotifyOnce` |
+
+```typescript
+import { listenPartialProfitAvailableOnce, commitPartialProfit } from "backtest-kit";
+
+// Take 50% profit exactly once on the first 50% milestone
+const cancel = listenPartialProfitAvailableOnce(
+  (event) => event.level === 50,
+  async (event) => {
+    await commitPartialProfit(event.symbol, 50);
+  }
+);
+
+// Cancel before it fires if needed
+cancel();
+```

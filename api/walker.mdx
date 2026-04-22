@@ -1,0 +1,335 @@
+---
+title: "Walker class: compare and optimize strategy parameters"
+description: "Use the Walker singleton to run A/B comparisons across multiple strategy variants and rank them by a configurable performance metric."
+---
+
+The `Walker` singleton runs a sequential backtest for every strategy registered in an `IWalkerSchema` and ranks them by a chosen `WalkerMetric`. It is designed for parameter search: you register N variants of a strategy (each with different parameter values), point a walker at them, and let it find the best performer. Walker calls `Backtest.run()` for each strategy in the list and aggregates the results into a ranked comparison report.
+
+## Walker context object
+
+Walker methods accept a single-field context object.
+
+<ParamField body="walkerName" type="string" required>
+  The name used when registering the walker with `addWalkerSchema()`.
+</ParamField>
+
+The `exchangeName` and `frameName` are pulled automatically from the registered `IWalkerSchema` — you do not pass them at call time.
+
+---
+
+## `Walker.run()`
+
+Runs A/B comparison for the given symbol. Returns an async generator that yields a progress update after each strategy completes its backtest.
+
+```typescript
+Walker.run(
+  symbol: string,
+  context: {
+    walkerName: WalkerName;
+  }
+): AsyncIterableIterator<WalkerProgressResult>
+```
+
+The generator is finite — it completes when all strategies in the schema have been tested.
+
+<ParamField body="symbol" type="string" required>
+  Trading pair symbol, e.g. `"BTCUSDT"`.
+</ParamField>
+
+<ParamField body="context" type="object" required>
+  Walker context. See [Walker context object](#walker-context-object).
+</ParamField>
+
+<ResponseField name="AsyncIterableIterator<WalkerProgressResult>" type="async iterator">
+  Yields a progress snapshot after each strategy finishes. Each snapshot includes `strategiesTested`, `totalStrategies`, `bestStrategy`, and `bestMetric`.
+</ResponseField>
+
+### Usage with `for await...of`
+
+```typescript
+import { Walker } from "backtest-kit";
+
+for await (const progress of Walker.run("BTCUSDT", {
+  walkerName: "my-optimizer",
+})) {
+  console.log(
+    `${progress.strategiesTested}/${progress.totalStrategies}`,
+    "best so far:", progress.bestStrategy
+  );
+}
+```
+
+---
+
+## `Walker.background()`
+
+Runs the walker in the background without exposing the generator. Returns a synchronous stop function.
+
+```typescript
+Walker.background(
+  symbol: string,
+  context: {
+    walkerName: WalkerName;
+  }
+): () => void
+```
+
+Calling the returned function immediately stops all strategies and marks the walker as done. Any strategy currently mid-backtest will be interrupted at the next checkpoint. Throws if a background task for the same instance is already running or has failed.
+
+<ParamField body="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+<ParamField body="context" type="object" required>
+  Walker context.
+</ParamField>
+
+<ResponseField name="() => void" type="function">
+  Stops all running strategy backtests and finalizes the walker.
+</ResponseField>
+
+### Example
+
+```typescript
+import { Walker } from "backtest-kit";
+
+const stop = Walker.background("BTCUSDT", { walkerName: "my-optimizer" });
+
+// Stop after 10 minutes if not finished
+setTimeout(stop, 10 * 60 * 1000);
+```
+
+---
+
+## `Walker.getData()`
+
+Returns the accumulated comparison results for a completed (or in-progress) walker run.
+
+```typescript
+Walker.getData(
+  symbol: string,
+  context: {
+    walkerName: WalkerName;
+  }
+): Promise<IWalkerResults>
+```
+
+<ParamField body="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+<ParamField body="context" type="object" required>
+  Walker context.
+</ParamField>
+
+<ResponseField name="IWalkerResults" type="object">
+  Contains `bestStrategy`, `bestMetric`, a ranked `results` array, `symbol`, `exchangeName`, `walkerName`, and `frameName`.
+</ResponseField>
+
+---
+
+## `Walker.getReport()`
+
+Generates a markdown-formatted comparison table for all tested strategies.
+
+```typescript
+Walker.getReport(
+  symbol: string,
+  context: {
+    walkerName: WalkerName;
+  },
+  strategyColumns?: StrategyColumn[],
+  pnlColumns?: PnlColumn[]
+): Promise<string>
+```
+
+<ParamField body="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+<ParamField body="context" type="object" required>
+  Walker context.
+</ParamField>
+
+<ParamField body="strategyColumns" type="StrategyColumn[]">
+  Optional selection of strategy-level columns to include in the report.
+</ParamField>
+
+<ParamField body="pnlColumns" type="PnlColumn[]">
+  Optional selection of PNL-level columns to include in the report.
+</ParamField>
+
+<ResponseField name="string" type="string">
+  A markdown string with a ranked table of all strategies and their metric values.
+</ResponseField>
+
+---
+
+## `Walker.dump()`
+
+Saves the comparison report to disk. The default path is `./dump/walker/<walkerName>.md`.
+
+```typescript
+Walker.dump(
+  symbol: string,
+  context: {
+    walkerName: WalkerName;
+  },
+  path?: string,
+  strategyColumns?: StrategyColumn[],
+  pnlColumns?: PnlColumn[]
+): Promise<void>
+```
+
+<ParamField body="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+<ParamField body="context" type="object" required>
+  Walker context.
+</ParamField>
+
+<ParamField body="path" type="string">
+  Optional directory path. Defaults to `"./dump/walker"`.
+</ParamField>
+
+<ParamField body="strategyColumns" type="StrategyColumn[]">
+  Optional strategy column selection.
+</ParamField>
+
+<ParamField body="pnlColumns" type="PnlColumn[]">
+  Optional PNL column selection.
+</ParamField>
+
+---
+
+## `addWalkerSchema()` and the `IWalkerSchema`
+
+Register a walker before calling any `Walker.*` method. The schema defines which strategies to compare, which exchange and frame to use, and which metric to optimize.
+
+```typescript
+import { addWalkerSchema } from "backtest-kit";
+
+addWalkerSchema({
+  walkerName: "my-optimizer",
+  exchangeName: "binance",
+  frameName: "1d-backtest",
+  strategies: [
+    "strategy-v1",
+    "strategy-v2",
+    "strategy-v3",
+  ],
+  metric: "sharpeRatio",
+  callbacks: {
+    onStrategyComplete: (strategyName, symbol, stats, metric) => {
+      console.log(`${strategyName}: metric=${metric}`);
+    },
+    onComplete: (results) => {
+      console.log("Winner:", results.bestStrategy);
+    },
+  },
+});
+```
+
+<ParamField body="walkerName" type="string" required>
+  Unique identifier for this walker.
+</ParamField>
+
+<ParamField body="exchangeName" type="string" required>
+  Exchange schema name to use for all strategy backtests.
+</ParamField>
+
+<ParamField body="frameName" type="string" required>
+  Frame schema name that defines the shared backtest date range.
+</ParamField>
+
+<ParamField body="strategies" type="string[]" required>
+  Ordered list of strategy names to compare. Each must be registered via `addStrategySchema()`.
+</ParamField>
+
+<ParamField body="metric" type="WalkerMetric">
+  Metric to maximize when ranking strategies. Defaults to `"sharpeRatio"`.
+</ParamField>
+
+<ParamField body="callbacks" type="Partial<IWalkerCallbacks>">
+  Optional lifecycle callbacks. See [IWalkerCallbacks](#iwalkercallbacks).
+</ParamField>
+
+---
+
+## `WalkerMetric` values
+
+The `metric` field controls which statistic is used to rank strategies. Higher values always rank higher.
+
+| Value | Description |
+|---|---|
+| `"sharpeRatio"` | Risk-adjusted return: mean PNL divided by standard deviation (default) |
+| `"annualizedSharpeRatio"` | Sharpe ratio scaled to a yearly basis (`sharpeRatio × √365`) |
+| `"winRate"` | Percentage of trades that closed in profit |
+| `"totalPnl"` | Sum of all PNL percentages across closed signals |
+| `"certaintyRatio"` | Average winning trade PNL divided by absolute average losing trade PNL |
+| `"avgPnl"` | Mean PNL per closed signal |
+| `"expectedYearlyReturns"` | Estimated number of trades per year extrapolated from the test period |
+
+---
+
+## `IWalkerCallbacks`
+
+<ParamField body="onStrategyStart" type="(strategyName, symbol) => void | Promise<void>">
+  Called before the backtest for each strategy begins.
+</ParamField>
+
+<ParamField body="onStrategyComplete" type="(strategyName, symbol, stats, metric) => void | Promise<void>">
+  Called after each strategy's backtest finishes. Receives the `BacktestStatisticsModel` and the computed metric value (or `null` if invalid).
+</ParamField>
+
+<ParamField body="onStrategyError" type="(strategyName, symbol, error) => void | Promise<void>">
+  Called if a strategy backtest throws an unhandled error.
+</ParamField>
+
+<ParamField body="onComplete" type="(results: IWalkerResults) => void | Promise<void>">
+  Called once after all strategies have been tested.
+</ParamField>
+
+---
+
+## Full parameter-search example
+
+The typical pattern is to define N strategy variants that close over different parameter values, register them all, point a walker at them, and call `Walker.run()`.
+
+```typescript
+import {
+  addStrategySchema,
+  addWalkerSchema,
+  Walker,
+} from "backtest-kit";
+
+// Register strategy variants with different parameters
+for (const [index, rsiPeriod] of [9, 14, 21].entries()) {
+  addStrategySchema({
+    strategyName: `rsi-strategy-${index}`,
+    interval: "5m",
+    getSignal: async (symbol, when, currentPrice) => {
+      // Use rsiPeriod in your signal logic
+      return null;
+    },
+  });
+}
+
+// Register walker pointing at all variants
+addWalkerSchema({
+  walkerName: "rsi-optimizer",
+  exchangeName: "binance",
+  frameName: "30d-backtest",
+  strategies: ["rsi-strategy-0", "rsi-strategy-1", "rsi-strategy-2"],
+  metric: "sharpeRatio",
+});
+
+// Run the comparison
+for await (const progress of Walker.run("BTCUSDT", { walkerName: "rsi-optimizer" })) {
+  console.log(`Tested ${progress.strategiesTested}/${progress.totalStrategies}`);
+}
+
+// Save report
+await Walker.dump("BTCUSDT", { walkerName: "rsi-optimizer" });
+```

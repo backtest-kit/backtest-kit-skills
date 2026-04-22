@@ -1,0 +1,76 @@
+---
+title: "Backtest Kit: build and deploy algorithmic trading bots"
+description: "Write a strategy once, backtest it on historical data, and deploy it as a live bot — with crash recovery and AI signal generation built in."
+---
+
+Backtest Kit is a TypeScript framework for building, testing, and deploying algorithmic trading strategies. You write your strategy logic once using a schema-based API, then run the exact same code against historical candle data or against a live exchange. Crash-safe persistence, signal validation, AI signal generation, and automatic report generation are built in — so you spend time on strategy logic rather than infrastructure.
+
+<CardGroup cols={2}>
+  <Card title="Quick start" icon="rocket" href="/quickstart">
+    Install Backtest Kit manually and run your first backtest in minutes.
+  </Card>
+  <Card title="Project scaffold" icon="hammer" href="/project-scaffold">
+    Generate a complete project with the CLI or Sidekick scaffold tool.
+  </Card>
+  <Card title="Core concepts" icon="book" href="/concepts/schemas">
+    Understand schemas, signal lifecycle, and execution modes.
+  </Card>
+  <Card title="API reference" icon="code" href="/api/backtest">
+    Browse the full public API — Backtest, Live, Walker, and more.
+  </Card>
+</CardGroup>
+
+## What Backtest Kit does
+
+Backtest Kit is a **time execution engine**, not a data-processing library. It steps through candles one at a time, evaluates your strategy at each tick, and manages the full position lifecycle — entry, partial closes, trailing stops, DCA, and exit — with accurate PnL tracking throughout.
+
+<CardGroup cols={2}>
+  <Card title="One codebase, two modes" icon="arrows-rotate">
+    The same strategy file runs in backtest mode and live mode. Switch execution context with a single call — no duplicate code paths.
+  </Card>
+  <Card title="Crash-safe persistence" icon="shield-halved">
+    Atomic file persistence snapshots live bot state after every mutation. If the process crashes, Backtest Kit replays from the last checkpoint — no lost positions, no duplicate signals.
+  </Card>
+  <Card title="AI signal generation" icon="robot">
+    Pass multi-timeframe candle data to an LLM (OpenAI, Ollama, DeepSeek, Claude) and return a structured signal. The `Dump` API stores agent context and answers for RAG retrieval on later ticks.
+  </Card>
+  <Card title="Rich order types" icon="chart-line">
+    Market, limit, TP/SL, OCO, grid, trailing stop, breakeven, dollar-cost averaging, partial profit and loss levels — all computed with VWAP-weighted pricing and accurate PnL.
+  </Card>
+  <Card title="Signal validation" icon="circle-check">
+    Define risk rules as validation functions in `addRiskSchema`. Each signal is checked for TP/SL distance, reward-to-risk ratio, and portfolio limits before entering a position.
+  </Card>
+  <Card title="Automatic reports" icon="chart-bar">
+    Call `Backtest.dump()` or `Live.dump()` after a run to generate a Markdown report with PnL, Sharpe ratio, win rate, drawdown, and per-trade details.
+  </Card>
+  <Card title="Transactional live orders" icon="lock">
+    The broker adapter intercepts every trade mutation before internal state changes. If the exchange rejects an order or the network fails, the position state is never updated — Backtest Kit retries on the next tick.
+  </Card>
+  <Card title="Pluggable data sources" icon="plug">
+    Connect any exchange via CCXT or a custom `getCandles` function. Swap file persistence for Redis, or replace the built-in position sizer with Kelly criterion or ATR-based sizing.
+  </Card>
+</CardGroup>
+
+## Supported order types
+
+Backtest Kit computes PnL for each of the following order types:
+
+- Market and limit entries
+- Take-profit / stop-loss and OCO exits
+- Grid orders with auto-cancel on unmet conditions
+- Partial profit and partial loss levels
+- Trailing stop-loss and trailing take-profit
+- Breakeven protection
+- Stop-limit entries before OCO
+- Dollar-cost averaging (DCA)
+- Time attack and infinite hold modes
+
+## What you need
+
+- Node.js 18 or later
+- TypeScript 5.0 or later (optional but recommended)
+- An exchange account or historical OHLCV data via CCXT
+
+<Card title="Run your first backtest" icon="rocket" href="/quickstart">
+  Follow the quick start to install Backtest Kit, register your first schemas, and run a backtest against one day of BTC/USDT data.
+</Card>

@@ -1,0 +1,349 @@
+---
+title: "@backtest-kit/ollama: LLM inference for trading strategies"
+description: "Unified HOF API for 10+ LLM providers. Wrap any async strategy function to add OpenAI, Claude, DeepSeek, Groq, or local Ollama inference with structured output."
+---
+
+`@backtest-kit/ollama` gives you a single, consistent API for integrating large language models into trading strategies. Instead of wiring up provider SDKs, authentication, and JSON parsing yourself, you wrap your existing async function with a provider HOF — one line gives you structured output, automatic token rotation, and Zod schema validation across 10+ providers.
+
+## Installation
+
+```bash
+npm install @backtest-kit/ollama backtest-kit agent-swarm-kit
+```
+
+Install the peer dependencies for the providers you need:
+
+<CodeGroup>
+
+```bash openai / DeepSeek / Mistral / Cohere / Perplexity / Alibaba / GLM-4
+# All providers that use the OpenAI-compatible SDK
+npm install openai
+```
+
+```bash Claude (Anthropic)
+# Claude uses the same openai package via base URL override
+npm install openai
+```
+
+```bash Grok (xAI)
+npm install @langchain/core @langchain/xai
+```
+
+```bash Groq
+npm install groq-sdk
+```
+
+```bash Ollama (local)
+npm install ollama
+```
+
+```bash HuggingFace
+npm install @huggingface/inference
+```
+
+</CodeGroup>
+
+## Supported providers
+
+Each provider is a higher-order function with the same signature:
+
+```typescript
+provider(fn, model, apiKey?) => fn
+```
+
+| Provider | Function | Model example |
+|----------|----------|---------------|
+| OpenAI | `gpt5()` | `"gpt-4o"` |
+| Claude (Anthropic) | `claude()` | `"claude-3-5-sonnet-20241022"` |
+| DeepSeek | `deepseek()` | `"deepseek-chat"` |
+| Grok (xAI) | `grok()` | `"grok-beta"` |
+| Mistral | `mistral()` | `"mistral-large-latest"` |
+| Groq | `groq()` | `"llama-3.3-70b-versatile"` |
+| Perplexity | `perplexity()` | `"llama-3.1-sonar-huge-128k-online"` |
+| Cohere | `cohere()` | `"command-r-plus"` |
+| Alibaba (Qwen) | `alibaba()` | `"qwen-max"` |
+| HuggingFace | `hf()` | `"meta-llama/Llama-3-70b"` |
+| Ollama (local) | `ollama()` | `"llama3.3:70b"` |
+| Zhipu AI | `glm4()` | `"glm-4-plus"` |
+
+## Calling a provider from `getSignal`
+
+Wrap your signal function with any provider HOF. The wrapped function has the same TypeScript signature as the original — the HOF is transparent to callers:
+
+<CodeGroup>
+
+```typescript DeepSeek
+import { deepseek, commitPrompt, Module, MessageModel } from '@backtest-kit/ollama';
+import { addStrategySchema } from 'backtest-kit';
+import { json } from 'agent-swarm-kit';
+
+const signalModule = Module.fromPath('./signal.prompt.cjs');
+
+const getSignal = async () => {
+  const messages: MessageModel[] = [];
+  await commitPrompt(signalModule, messages);
+
+  const { data } = await json('SignalOutline', messages);
+  return data;
+};
+
+addStrategySchema({
+  strategyName: 'deepseek-strategy',
+  interval: '5m',
+  getSignal: deepseek(getSignal, 'deepseek-chat', process.env.DEEPSEEK_API_KEY),
+});
+```
+
+```typescript OpenAI
+import { gpt5, commitPrompt, Module, MessageModel } from '@backtest-kit/ollama';
+import { addStrategySchema } from 'backtest-kit';
+import { json } from 'agent-swarm-kit';
+
+const signalModule = Module.fromPath('./signal.prompt.cjs');
+
+const getSignal = async () => {
+  const messages: MessageModel[] = [];
+  await commitPrompt(signalModule, messages);
+
+  const { data } = await json('SignalOutline', messages);
+  return data;
+};
+
+addStrategySchema({
+  strategyName: 'gpt-strategy',
+  interval: '5m',
+  getSignal: gpt5(getSignal, 'gpt-4o', process.env.OPENAI_API_KEY),
+});
+```
+
+```typescript Claude
+import { claude, commitPrompt, Module, MessageModel } from '@backtest-kit/ollama';
+import { addStrategySchema } from 'backtest-kit';
+import { json } from 'agent-swarm-kit';
+
+const signalModule = Module.fromPath('./signal.prompt.cjs');
+
+const getSignal = async () => {
+  const messages: MessageModel[] = [];
+  await commitPrompt(signalModule, messages);
+
+  const { data } = await json('SignalOutline', messages);
+  return data;
+};
+
+addStrategySchema({
+  strategyName: 'claude-strategy',
+  interval: '5m',
+  getSignal: claude(getSignal, 'claude-3-5-sonnet-20241022', process.env.ANTHROPIC_API_KEY),
+});
+```
+
+```typescript Ollama (local)
+import { ollama, commitPrompt, Module, MessageModel } from '@backtest-kit/ollama';
+import { addStrategySchema } from 'backtest-kit';
+import { json } from 'agent-swarm-kit';
+
+const signalModule = Module.fromPath('./signal.prompt.cjs');
+
+const getSignal = async () => {
+  const messages: MessageModel[] = [];
+  await commitPrompt(signalModule, messages);
+
+  const { data } = await json('SignalOutline', messages);
+  return data;
+};
+
+addStrategySchema({
+  strategyName: 'ollama-strategy',
+  interval: '5m',
+  // apiKey is optional for local Ollama
+  getSignal: ollama(getSignal, 'llama3.3:70b'),
+});
+```
+
+```typescript Groq
+import { groq, commitPrompt, Module, MessageModel } from '@backtest-kit/ollama';
+import { addStrategySchema } from 'backtest-kit';
+import { json } from 'agent-swarm-kit';
+
+const signalModule = Module.fromPath('./signal.prompt.cjs');
+
+const getSignal = async () => {
+  const messages: MessageModel[] = [];
+  await commitPrompt(signalModule, messages);
+
+  const { data } = await json('SignalOutline', messages);
+  return data;
+};
+
+addStrategySchema({
+  strategyName: 'groq-strategy',
+  interval: '5m',
+  getSignal: groq(getSignal, 'llama-3.3-70b-versatile', process.env.GROQ_API_KEY),
+});
+```
+
+</CodeGroup>
+
+## Token rotation
+
+Pass an array of API keys to rotate through them automatically. This is useful when a single key has rate limits or when you want to distribute load across multiple accounts:
+
+```typescript
+import { ollama } from '@backtest-kit/ollama';
+
+const wrappedFn = ollama(myFn, 'llama3.3:70b', ['key1', 'key2', 'key3']);
+```
+
+The same pattern works for every provider HOF.
+
+## Prompts
+
+### File-based prompt modules
+
+Load prompts from `.cjs` files in `config/prompt/`. This keeps prompt text separate from strategy logic and makes it easy to iterate without touching TypeScript:
+
+```javascript
+// config/prompt/signal.prompt.cjs
+module.exports = {
+  system: (symbol, strategyName, exchangeName, frameName, backtest) => [
+    `You are analyzing ${symbol} on ${exchangeName}`,
+    `Strategy: ${strategyName}, Timeframe: ${frameName}`,
+    backtest ? 'Backtest mode' : 'Live mode',
+  ],
+  user: (symbol) => `Analyze ${symbol} and return a trading decision`,
+};
+```
+
+Load and commit the module to a message array:
+
+```typescript
+import { Module, commitPrompt, MessageModel } from '@backtest-kit/ollama';
+
+const signalModule = Module.fromPath('./signal.prompt.cjs');
+
+const messages: MessageModel[] = [];
+await commitPrompt(signalModule, messages);
+// messages now contains { role: 'system', content: '...' } and { role: 'user', content: '...' }
+```
+
+`Module.fromPath` resolves relative paths from `{cwd}/config/prompt/` by default. Pass a second `baseDir` argument to override.
+
+### Inline prompts
+
+Define prompts directly in code without a `.cjs` file:
+
+```typescript
+import { Prompt, commitPrompt, MessageModel } from '@backtest-kit/ollama';
+
+const prompt = Prompt.fromPrompt({
+  system: ['You are a trading bot', 'Be conservative with signals'],
+  user: (symbol) => `What is the trend for ${symbol}?`,
+});
+
+const messages: MessageModel[] = [];
+await commitPrompt(prompt, messages);
+```
+
+### `PromptModel` interface
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `system` | `string[] \| SystemPromptFn` | System instructions — static array or function receiving `(symbol, strategyName, exchangeName, frameName, backtest)` |
+| `user` | `string \| UserPromptFn` | User prompt — static string or the same context function |
+
+## Structured output with Zod
+
+Use `addOutline` from `agent-swarm-kit` with `CompletionName.RunnerOutlineCompletion` to enforce a typed JSON schema on every LLM response. The outline runs validation rules and retries automatically if the response fails:
+
+```typescript
+// schema/Signal.schema.ts
+import { z } from 'zod';
+
+export const SignalSchema = z.object({
+  position: z.enum(['long', 'short', 'wait']).describe(
+    'Position direction: long for bullish, short for bearish, wait for conflicting signals'
+  ),
+  price_open: z.number().describe('Entry price in USD'),
+  price_stop_loss: z.number().describe('Stop-loss price in USD'),
+  price_take_profit: z.number().describe('Take-profit price in USD'),
+  minute_estimated_time: z.number().describe('Estimated time to reach TP in minutes'),
+  risk_note: z.string().describe('Risk assessment with specific numbers'),
+});
+
+export type TSignalSchema = z.infer<typeof SignalSchema>;
+```
+
+```typescript
+// outline/signal.outline.ts
+import { addOutline } from 'agent-swarm-kit';
+import { zodResponseFormat } from 'openai/helpers/zod';
+import { SignalSchema, TSignalSchema } from '../schema/Signal.schema';
+import { CompletionName } from '@backtest-kit/ollama';
+
+addOutline<TSignalSchema>({
+  outlineName: 'SignalOutline',
+  completion: CompletionName.RunnerOutlineCompletion,
+  format: zodResponseFormat(SignalSchema, 'position_decision'),
+  getOutlineHistory: async ({ history, param: messages = [] }) => {
+    await history.push(messages);
+  },
+  validations: [
+    {
+      validate: ({ data }) => {
+        if (data.position === 'long' && data.price_stop_loss >= data.price_open) {
+          throw new Error('For LONG, stop_loss must be below price_open');
+        }
+        if (data.position === 'short' && data.price_stop_loss <= data.price_open) {
+          throw new Error('For SHORT, stop_loss must be above price_open');
+        }
+      },
+    },
+  ],
+});
+```
+
+You can also use a plain JSON schema object instead of Zod — pass it as `format` directly.
+
+## `CompletionName` enum
+
+| Value | Description |
+|-------|-------------|
+| `CompletionName.RunnerCompletion` | Standard completion — full response at once |
+| `CompletionName.RunnerStreamCompletion` | Streaming completion — progressive response chunks |
+| `CompletionName.RunnerOutlineCompletion` | Structured JSON output with schema validation and retry |
+
+## API reference
+
+### Provider HOFs
+
+All provider HOFs share the same signature:
+
+```typescript
+ollama | gpt5 | claude | deepseek | grok | mistral | perplexity | cohere | alibaba | hf | groq | glm4
+<T extends (...args: any[]) => Promise<any>>(fn: T, model: string, apiKey?: string | string[]) => T
+```
+
+### `Module.fromPath`
+
+```typescript
+Module.fromPath(path: string, baseDir?: string): Module
+```
+
+Creates a module reference for a `.cjs` prompt file. Default `baseDir` is `{cwd}/config/prompt/`.
+
+### `Prompt.fromPrompt`
+
+```typescript
+Prompt.fromPrompt(source: PromptModel): Prompt
+```
+
+Creates an inline prompt object from a `PromptModel`.
+
+### `commitPrompt`
+
+```typescript
+async function commitPrompt(source: Module | Prompt, history: MessageModel[]): Promise<void>
+```
+
+Resolves the prompt using the current execution context (symbol, strategy name, exchange name, frame name, backtest flag) and appends system and user messages to `history`.

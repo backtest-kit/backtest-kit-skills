@@ -1,0 +1,305 @@
+---
+title: "Global configuration: setConfig and setLogger reference"
+description: "Learn how to tune slippage, fees, position sizing, signal lifetime, DCA behavior, and all other global parameters with setConfig() and setLogger()."
+---
+
+Backtest Kit ships with a set of default parameters that work for most strategies out of the box. You can override any subset of them by calling `setConfig()` before starting a backtest or live session. Changes take effect immediately and are validated against internal constraints — if a value is out of range, `setConfig()` rolls back to the previous state and throws.
+
+## Setting configuration
+
+```typescript
+import { setConfig } from "backtest-kit";
+
+setConfig({
+  CC_PERCENT_SLIPPAGE: 0.05,
+  CC_PERCENT_FEE: 0.1,
+  CC_POSITION_ENTRY_COST: 250,
+  CC_MAX_SIGNAL_LIFETIME_MINUTES: 2880,
+});
+```
+
+You can call `setConfig()` with any partial subset of `GlobalConfig`. Keys you omit keep their current value.
+
+```typescript
+import { getConfig, getDefaultConfig } from "backtest-kit";
+
+// Inspect the live config (returns a shallow copy)
+const current = getConfig();
+
+// Inspect the original defaults (frozen object)
+const defaults = getDefaultConfig();
+```
+
+<Note>
+Call `setConfig()` once at application startup, before registering strategies or running backtests. Changing config mid-run can produce inconsistent results across strategy ticks.
+</Note>
+
+## GlobalConfig type
+
+```typescript
+import { GlobalConfig } from "backtest-kit";
+
+type GlobalConfig = {
+  CC_PERCENT_SLIPPAGE: number;
+  CC_PERCENT_FEE: number;
+  CC_SCHEDULE_AWAIT_MINUTES: number;
+  CC_AVG_PRICE_CANDLES_COUNT: number;
+  CC_MIN_TAKEPROFIT_DISTANCE_PERCENT: number;
+  CC_MIN_STOPLOSS_DISTANCE_PERCENT: number;
+  CC_MAX_STOPLOSS_DISTANCE_PERCENT: number;
+  CC_MAX_SIGNAL_LIFETIME_MINUTES: number;
+  CC_MAX_SIGNAL_GENERATION_SECONDS: number;
+  CC_GET_CANDLES_RETRY_COUNT: number;
+  CC_GET_CANDLES_RETRY_DELAY_MS: number;
+  CC_MAX_CANDLES_PER_REQUEST: number;
+  CC_GET_CANDLES_PRICE_ANOMALY_THRESHOLD_FACTOR: number;
+  CC_GET_CANDLES_MIN_CANDLES_FOR_MEDIAN: number;
+  CC_REPORT_SHOW_SIGNAL_NOTE: boolean;
+  CC_BREAKEVEN_THRESHOLD: number;
+  CC_ORDER_BOOK_TIME_OFFSET_MINUTES: number;
+  CC_ORDER_BOOK_MAX_DEPTH_LEVELS: number;
+  CC_AGGREGATED_TRADES_MAX_MINUTES: number;
+  CC_MAX_BACKTEST_MARKDOWN_ROWS: number;
+  CC_MAX_BREAKEVEN_MARKDOWN_ROWS: number;
+  CC_MAX_HEATMAP_MARKDOWN_ROWS: number;
+  CC_MAX_HIGHEST_PROFIT_MARKDOWN_ROWS: number;
+  CC_MAX_MAX_DRAWDOWN_MARKDOWN_ROWS: number;
+  CC_MAX_LIVE_MARKDOWN_ROWS: number;
+  CC_MAX_PARTIAL_MARKDOWN_ROWS: number;
+  CC_MAX_RISK_MARKDOWN_ROWS: number;
+  CC_MAX_SCHEDULE_MARKDOWN_ROWS: number;
+  CC_MAX_STRATEGY_MARKDOWN_ROWS: number;
+  CC_MAX_SYNC_MARKDOWN_ROWS: number;
+  CC_WALKER_MARKDOWN_TOP_N: number;
+  CC_MAX_PERFORMANCE_MARKDOWN_ROWS: number;
+  CC_MAX_NOTIFICATIONS: number;
+  CC_MAX_SIGNALS: number;
+  CC_MAX_LOG_LINES: number;
+  CC_ENABLE_CANDLE_FETCH_MUTEX: boolean;
+  CC_ENABLE_DCA_EVERYWHERE: boolean;
+  CC_ENABLE_PPPL_EVERYWHERE: boolean;
+  CC_ENABLE_TRAILING_EVERYWHERE: boolean;
+  CC_POSITION_ENTRY_COST: number;
+};
+```
+
+## Config keys
+
+### Execution costs
+
+<ParamField body="CC_PERCENT_SLIPPAGE" type="number" default="0.1">
+  Slippage percentage applied to both entry and exit prices. Simulates market impact and order book depth. Applied twice per round-trip — entry and exit — for a total slippage effect of approximately 0.2%.
+</ParamField>
+
+<ParamField body="CC_PERCENT_FEE" type="number" default="0.1">
+  Exchange fee percentage charged per transaction. Applied twice — entry and exit — for a total fee of 0.2% per round-trip.
+</ParamField>
+
+<ParamField body="CC_POSITION_ENTRY_COST" type="number" default="100">
+  Dollar cost of a single position entry. Used as the default when cost is not provided by the strategy. Each DCA entry is also sized at this value by default.
+</ParamField>
+
+### Signal price guards
+
+<ParamField body="CC_MIN_TAKEPROFIT_DISTANCE_PERCENT" type="number" default="0.5">
+  Minimum take-profit distance from the entry price, expressed as a percentage. Must exceed the combined cost of slippage and fees to ensure trades can be profitable. The default of 0.5% covers 0.2% slippage + 0.2% fees + 0.1% minimum profit buffer.
+</ParamField>
+
+<ParamField body="CC_MIN_STOPLOSS_DISTANCE_PERCENT" type="number" default="0.5">
+  Minimum stop-loss distance from the entry price as a percentage. Prevents signals from being stopped out immediately due to normal market noise.
+</ParamField>
+
+<ParamField body="CC_MAX_STOPLOSS_DISTANCE_PERCENT" type="number" default="20">
+  Maximum stop-loss distance from the entry price as a percentage. Prevents a single signal from losing more than 20% of the position value.
+</ParamField>
+
+### Signal lifetime
+
+<ParamField body="CC_MAX_SIGNAL_LIFETIME_MINUTES" type="number" default="1440">
+  Maximum number of minutes a signal can remain open before it is expired automatically. Also used as the default `minuteEstimatedTime` when a signal does not supply one. Set to `Infinity` to allow signals to live indefinitely until TP/SL is hit or the position is closed manually.
+</ParamField>
+
+<ParamField body="CC_MAX_SIGNAL_GENERATION_SECONDS" type="number" default="180">
+  Maximum time allowed for a `getSignal` call to complete, in seconds. If your strategy fetches external data or calls an LLM, ensure it resolves within this window. Calls that exceed the limit are aborted.
+</ParamField>
+
+### Scheduling
+
+<ParamField body="CC_SCHEDULE_AWAIT_MINUTES" type="number" default="120">
+  How long the framework waits for a scheduled (pending) signal to activate, in minutes. If the signal's entry price is not reached within this window, the signal is cancelled.
+</ParamField>
+
+### Price averaging
+
+<ParamField body="CC_AVG_PRICE_CANDLES_COUNT" type="number" default="5">
+  Number of 1-minute candles used to calculate the VWAP entry/exit price. Increasing this value smooths out price spikes but introduces more latency in price tracking.
+</ParamField>
+
+### Candle fetching
+
+<ParamField body="CC_GET_CANDLES_RETRY_COUNT" type="number" default="3">
+  Number of retry attempts when a `getCandles` call to the exchange fails.
+</ParamField>
+
+<ParamField body="CC_GET_CANDLES_RETRY_DELAY_MS" type="number" default="5000">
+  Delay between retry attempts for `getCandles`, in milliseconds.
+</ParamField>
+
+<ParamField body="CC_MAX_CANDLES_PER_REQUEST" type="number" default="1000">
+  Maximum number of candles to fetch in a single API call. Requests that require more candles are automatically paginated.
+</ParamField>
+
+<ParamField body="CC_GET_CANDLES_PRICE_ANOMALY_THRESHOLD_FACTOR" type="number" default="1000">
+  Anomaly detection factor for candle prices. If a candle's price is more than this factor lower than the median reference price, the candle is rejected as anomalous. Catches near-zero prices from incomplete Binance candles without being too strict for low-cap assets.
+</ParamField>
+
+<ParamField body="CC_GET_CANDLES_MIN_CANDLES_FOR_MEDIAN" type="number" default="5">
+  Minimum number of candles required before the median is used for anomaly detection. Below this threshold, a simple average is used instead, because the median is statistically unreliable on small datasets.
+</ParamField>
+
+<ParamField body="CC_ENABLE_CANDLE_FETCH_MUTEX" type="boolean" default="true">
+  When enabled, concurrent candle fetches for the same symbol and interval are serialized with a mutex lock. This prevents redundant API calls when multiple strategy ticks fire simultaneously.
+</ParamField>
+
+### Breakeven
+
+<ParamField body="CC_BREAKEVEN_THRESHOLD" type="number" default="0.2">
+  Minimum profit distance from entry, as a percentage, required before the stop-loss can be moved to breakeven. Ensures the position has moved far enough to cover costs before the protective stop is raised.
+</ParamField>
+
+### DCA, partials, and trailing
+
+<ParamField body="CC_ENABLE_DCA_EVERYWHERE" type="boolean" default="false">
+  When `false`, `commitAverageBuy` is only accepted when the current price sets a new low since entry (anti-record condition). When `true`, DCA is accepted whenever the current price is below `priceOpen`, even if it is not a new low. Enables more aggressive cost averaging.
+</ParamField>
+
+<ParamField body="CC_ENABLE_PPPL_EVERYWHERE" type="boolean" default="false">
+  When `false`, partial profit/loss exits are only applied when they do not mix profit and loss outcomes on the same position. When `true`, the framework allows mixed profit/loss exits to lock in gains or cut exposure regardless of direction consistency.
+</ParamField>
+
+<ParamField body="CC_ENABLE_TRAILING_EVERYWHERE" type="boolean" default="false">
+  When `false`, trailing stop/take mechanisms activate only after absorption conditions are detected. When `true`, trailing activates regardless of absorption, making the mechanism more reactive to price movement at the cost of increased sensitivity to noise.
+</ParamField>
+
+### Order book
+
+<ParamField body="CC_ORDER_BOOK_TIME_OFFSET_MINUTES" type="number" default="10">
+  Time offset applied when fetching order book snapshots, in minutes. Subtracting this offset from the current time avoids fetching volatile real-time order book data.
+</ParamField>
+
+<ParamField body="CC_ORDER_BOOK_MAX_DEPTH_LEVELS" type="number" default="1000">
+  Maximum number of price levels (bids and asks) to fetch from the order book.
+</ParamField>
+
+<ParamField body="CC_AGGREGATED_TRADES_MAX_MINUTES" type="number" default="60">
+  Maximum number of minutes of aggregated trades to fetch when no explicit limit is provided.
+</ParamField>
+
+### Report row limits
+
+These keys cap the number of events stored in each in-memory markdown report. When the limit is exceeded, the oldest entries are evicted (FIFO).
+
+<ParamField body="CC_MAX_BACKTEST_MARKDOWN_ROWS" type="number" default="250">
+  Maximum rows in the backtest report.
+</ParamField>
+
+<ParamField body="CC_MAX_LIVE_MARKDOWN_ROWS" type="number" default="250">
+  Maximum rows in the live trading report.
+</ParamField>
+
+<ParamField body="CC_MAX_RISK_MARKDOWN_ROWS" type="number" default="250">
+  Maximum rows in the risk report.
+</ParamField>
+
+<ParamField body="CC_MAX_SCHEDULE_MARKDOWN_ROWS" type="number" default="250">
+  Maximum rows in the schedule report.
+</ParamField>
+
+<ParamField body="CC_MAX_PARTIAL_MARKDOWN_ROWS" type="number" default="250">
+  Maximum rows in the partial profit/loss report.
+</ParamField>
+
+<ParamField body="CC_MAX_BREAKEVEN_MARKDOWN_ROWS" type="number" default="250">
+  Maximum rows in the breakeven report.
+</ParamField>
+
+<ParamField body="CC_MAX_HEATMAP_MARKDOWN_ROWS" type="number" default="250">
+  Maximum rows in the heatmap report.
+</ParamField>
+
+<ParamField body="CC_MAX_HIGHEST_PROFIT_MARKDOWN_ROWS" type="number" default="250">
+  Maximum rows in the highest profit milestone report.
+</ParamField>
+
+<ParamField body="CC_MAX_MAX_DRAWDOWN_MARKDOWN_ROWS" type="number" default="250">
+  Maximum rows in the max drawdown milestone report.
+</ParamField>
+
+<ParamField body="CC_MAX_STRATEGY_MARKDOWN_ROWS" type="number" default="250">
+  Maximum rows in the strategy lifecycle report.
+</ParamField>
+
+<ParamField body="CC_MAX_SYNC_MARKDOWN_ROWS" type="number" default="250">
+  Maximum rows in the signal sync report.
+</ParamField>
+
+<ParamField body="CC_MAX_PERFORMANCE_MARKDOWN_ROWS" type="number" default="10000">
+  Maximum performance metric events retained. Higher than other limits because metrics are lightweight and benefit from larger sample sizes for statistical accuracy.
+</ParamField>
+
+<ParamField body="CC_WALKER_MARKDOWN_TOP_N" type="number" default="10">
+  Number of top strategies included in the walker comparison table.
+</ParamField>
+
+### Storage limits
+
+<ParamField body="CC_MAX_NOTIFICATIONS" type="number" default="500">
+  Maximum number of notifications kept in memory. Older entries are evicted when this limit is exceeded.
+</ParamField>
+
+<ParamField body="CC_MAX_SIGNALS" type="number" default="50">
+  Maximum number of signals retained in storage.
+</ParamField>
+
+<ParamField body="CC_MAX_LOG_LINES" type="number" default="1000">
+  Maximum number of log lines retained in memory. Prevents unbounded log growth that would degrade performance over time.
+</ParamField>
+
+### Report visibility
+
+<ParamField body="CC_REPORT_SHOW_SIGNAL_NOTE" type="boolean" default="false">
+  When `true`, a "Note" column is displayed in all markdown report tables. Disabled by default to reduce table width and improve readability.
+</ParamField>
+
+## Setting a logger
+
+By default, the framework uses a no-op logger that silently discards all messages. To enable logging, pass an object implementing `ILogger` to `setLogger()`.
+
+```typescript
+import { setLogger } from "backtest-kit";
+import type { ILogger } from "backtest-kit";
+
+setLogger({
+  log: (topic, ...args) => console.log("[LOG]", topic, ...args),
+  debug: (topic, ...args) => console.debug("[DEBUG]", topic, ...args),
+  info: (topic, ...args) => console.info("[INFO]", topic, ...args),
+  warn: (topic, ...args) => console.warn("[WARN]", topic, ...args),
+});
+```
+
+The `ILogger` interface:
+
+```typescript
+interface ILogger {
+  log(topic: string, ...args: any[]): void;
+  debug(topic: string, ...args: any[]): void;
+  info(topic: string, ...args: any[]): void;
+  warn(topic: string, ...args: any[]): void;
+}
+```
+
+The framework automatically injects the current method context (`strategyName`, `exchangeName`, `frameName`) and execution context (`symbol`, `when`, `backtest`) as trailing arguments on every log call, so you get rich contextual information without any extra wiring.
+
+<Tip>
+During development you can wire all four methods to the corresponding `console` methods. In production you might route `info` and `warn` to an external log aggregator while keeping `debug` silent.
+</Tip>

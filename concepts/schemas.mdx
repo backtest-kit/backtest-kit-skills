@@ -1,0 +1,231 @@
+---
+title: "Schemas: registering exchanges, strategies, and frames"
+description: "Schemas are named registries that wire together Backtest Kit. Register an exchange, strategy, frame, or risk profile once and reference it by name everywhere."
+---
+
+Backtest Kit is built around a registry pattern: before you run a backtest or start a live bot, you register each component — exchange adapter, strategy logic, time frame, risk rules — as a named schema. The runner looks up those names at runtime and assembles the pipeline. This keeps your configuration declarative and your strategy code independent of any specific data source or risk profile.
+
+There are six schema types in total: **Exchange**, **Strategy**, **Frame**, **Risk**, **Sizing**, and **Walker**. The four you will use in almost every project are Exchange, Strategy, Frame, and Risk.
+
+## How the registry works
+
+Each `add*Schema` call stores your configuration under a string key. When you pass that name to `Backtest.background()` or `Live.background()`, the framework retrieves the registered schema and injects it into the execution pipeline. You can register multiple schemas of the same type and switch between them just by changing the name you pass to the runner.
+
+```typescript
+import {
+  addExchangeSchema,
+  addStrategySchema,
+  addFrameSchema,
+  addRiskSchema,
+} from 'backtest-kit';
+```
+
+## Schema types
+
+<Tabs>
+  <Tab title="Exchange">
+    An Exchange schema tells Backtest Kit how to fetch candle data and how to format prices and quantities for a given market. The only required field is `getCandles`; `formatPrice` and `formatQuantity` are optional and default to Binance BTC precision if omitted.
+
+    ```typescript
+    import ccxt from 'ccxt';
+    import { addExchangeSchema } from 'backtest-kit';
+
+    addExchangeSchema({
+      exchangeName: 'binance',
+      getCandles: async (symbol, interval, since, limit) => {
+        const exchange = new ccxt.binance();
+        const ohlcv = await exchange.fetchOHLCV(symbol, interval, since.getTime(), limit);
+        return ohlcv.map(([timestamp, open, high, low, close, volume]) => ({
+          timestamp, open, high, low, close, volume,
+        }));
+      },
+      formatPrice: (symbol, price) => price.toFixed(2),
+      formatQuantity: (symbol, quantity) => quantity.toFixed(8),
+    });
+    ```
+
+    The `exchangeName` string is the key you pass to `Backtest.background()` and `Live.background()` as `exchangeName`.
+
+    <Note>
+      In live mode, `getCandles` is called with real market data. In backtest mode, it is called with historical timestamps derived from the frame's date range. The same function handles both — the `backtest` boolean argument tells you which mode is active if you need to branch.
+    </Note>
+  </Tab>
+
+  <Tab title="Strategy">
+    A Strategy schema contains your signal generation logic. The `getSignal` function is called on every tick (throttled by `interval`) and should return an `ISignalDto` when you want to open a position, or `null` when you do not.
+
+    ```typescript
+    import { addStrategySchema } from 'backtest-kit';
+    import { v4 as uuid } from 'uuid';
+
+    addStrategySchema({
+      strategyName: 'my-strategy',
+      interval: '5m',          // minimum time between getSignal calls
+      riskName: 'demo',        // optional: link a risk profile
+      getSignal: async (symbol, when, currentPrice) => {
+        // return null to skip, or a signal object to open a position
+        return {
+          id: uuid(),
+          position: 'long',
+          priceTakeProfit: currentPrice * 1.03,
+          priceStopLoss: currentPrice * 0.98,
+          minuteEstimatedTime: 240,
+        };
+      },
+    });
+    ```
+
+    | Field | Required | Description |
+    |---|---|---|
+    | `strategyName` | Yes | Unique key for the registry |
+    | `getSignal` | Yes | Signal generation function |
+    | `interval` | No | Throttle interval (default: `1m`) |
+    | `riskName` | No | Risk profile to apply before opening |
+    | `callbacks` | No | Lifecycle hooks: `onOpen`, `onClose`, `onActive`, etc. |
+  </Tab>
+
+  <Tab title="Frame">
+    A Frame schema defines the historical time range and tick granularity for a backtest. It has no effect in live mode — live trading uses the current wall clock time instead.
+
+    ```typescript
+    import { addFrameSchema } from 'backtest-kit';
+
+    addFrameSchema({
+      frameName: '1d-test',
+      interval: '1m',
+      startDate: new Date('2025-12-01'),
+      endDate: new Date('2025-12-02'),
+    });
+    ```
+
+    The `interval` controls how many ticks the backtest engine generates between `startDate` and `endDate`. A `1m` interval on a one-day range produces 1 440 ticks. Use a coarser interval (e.g. `5m`) to speed up iteration when your strategy only checks signals every five minutes.
+
+    <Tip>
+      Match `interval` in your Frame schema to the `interval` you set in your Strategy schema. If your strategy is throttled to `5m` but your frame generates `1m` ticks, the strategy will still only call `getSignal` every five minutes — the extra ticks are used only for TP/SL monitoring.
+    </Tip>
+  </Tab>
+
+  <Tab title="Risk">
+    A Risk schema lets you attach custom validation logic that runs before any signal is accepted. Signals that fail validation are silently rejected — the strategy continues running and will try again on the next tick.
+
+    ```typescript
+    import { addRiskSchema } from 'backtest-kit';
+
+    addRiskSchema({
+      riskName: 'demo',
+      validations: [
+        // TP must be at least 1% away from entry
+        ({ pendingSignal, currentPrice }) => {
+          const { priceOpen = currentPrice, priceTakeProfit, position } = pendingSignal;
+          const tpDistance = position === 'long'
+            ? ((priceTakeProfit - priceOpen) / priceOpen) * 100
+            : ((priceOpen - priceTakeProfit) / priceOpen) * 100;
+          if (tpDistance < 1) throw new Error(`TP too close: ${tpDistance.toFixed(2)}%`);
+        },
+        // R/R ratio must be at least 2:1
+        ({ pendingSignal, currentPrice }) => {
+          const { priceOpen = currentPrice, priceTakeProfit, priceStopLoss, position } = pendingSignal;
+          const reward = position === 'long' ? priceTakeProfit - priceOpen : priceOpen - priceTakeProfit;
+          const risk   = position === 'long' ? priceOpen - priceStopLoss : priceStopLoss - priceOpen;
+          if (reward / risk < 2) throw new Error('Poor R/R ratio');
+        },
+      ],
+    });
+    ```
+
+    Each entry in `validations` is either a plain function or an object with a `validate` function and an optional `note`. The validation receives the pending signal, current price, and a list of all active positions across strategies.
+
+    See [Risk management](/concepts/risk-management) for the full validation payload reference.
+  </Tab>
+
+  <Tab title="Sizing">
+    A Sizing schema defines how much capital to allocate to each position. You can use a fixed percentage of your portfolio, Kelly Criterion, or ATR-based sizing.
+
+    ```typescript
+    import { addSizingSchema } from 'backtest-kit';
+
+    addSizingSchema({
+      sizingName: 'fixed-100',
+      calculate: async (params) => {
+        // return cost in USD for this position
+        return 100;
+      },
+    });
+    ```
+
+    If you do not register a Sizing schema, positions default to `CC_POSITION_ENTRY_COST` (100 USD). You can change the global default with `setConfig({ CC_POSITION_ENTRY_COST: 200 })`.
+  </Tab>
+
+  <Tab title="Walker">
+    A Walker schema is used for parameter optimization. It runs a strategy across a grid of parameter combinations and ranks the results by a metric such as Sharpe ratio or win rate.
+
+    ```typescript
+    import { addWalkerSchema } from 'backtest-kit';
+
+    addWalkerSchema({
+      walkerName: 'optimize-tp',
+      metric: 'sharpe',
+      strategyName: 'my-strategy',
+      exchangeName: 'binance',
+      frameName: '1d-test',
+      params: {
+        tpPercent: [1, 2, 3, 4, 5],
+      },
+    });
+    ```
+
+    Use `Walker.background()` to run optimization and `listenDoneWalker` to collect results.
+  </Tab>
+</Tabs>
+
+## Putting it all together
+
+A typical setup file registers all four core schemas before starting the runner:
+
+```typescript
+import { addExchangeSchema, addStrategySchema, addFrameSchema, addRiskSchema } from 'backtest-kit';
+
+// 1. Data source
+addExchangeSchema({ exchangeName: 'binance', getCandles: /* ... */ });
+
+// 2. Risk rules
+addRiskSchema({ riskName: 'demo', validations: [/* ... */] });
+
+// 3. Strategy logic (references risk by name)
+addStrategySchema({ strategyName: 'my-strategy', riskName: 'demo', getSignal: /* ... */ });
+
+// 4. Backtest period (not needed for live)
+addFrameSchema({ frameName: '1d-test', interval: '1m', startDate: new Date('2025-12-01'), endDate: new Date('2025-12-02') });
+```
+
+You can also override a previously registered schema without re-registering everything:
+
+```typescript
+import { overrideStrategySchema } from 'backtest-kit';
+
+overrideStrategySchema('my-strategy', { interval: '15m' });
+```
+
+<AccordionGroup>
+  <Accordion title="Listing registered schemas">
+    Use the `list*Schema` functions to inspect what is currently registered:
+
+    ```typescript
+    import { listStrategySchema, listExchangeSchema, listFrameSchema, listRiskSchema } from 'backtest-kit';
+
+    const strategies = listStrategySchema(); // string[]
+    const exchanges  = listExchangeSchema(); // string[]
+    ```
+  </Accordion>
+
+  <Accordion title="Reading a schema back">
+    Use the `get*Schema` functions to retrieve the full schema object:
+
+    ```typescript
+    import { getStrategySchema } from 'backtest-kit';
+
+    const schema = getStrategySchema('my-strategy');
+    console.log(schema.interval); // '5m'
+    ```
+  </Accordion>
+</AccordionGroup>

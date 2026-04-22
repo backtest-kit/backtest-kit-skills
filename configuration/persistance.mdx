@@ -1,0 +1,151 @@
+---
+title: "Customize and replace Backtest Kit persistence adapters"
+description: "Understand how Backtest Kit saves signal state to disk for crash recovery, and learn how to replace the built-in file adapter with a custom implementation."
+---
+
+When you run a live trading session, Backtest Kit writes the state of every open signal, position, scheduled entry, partial level, and breakeven flag to disk after each mutation. If the process crashes and restarts, the framework reads these files during initialization and resumes monitoring from exactly where it left off — no duplicate orders, no lost positions.
+
+<Note>
+Persistence is only active in live mode (`backtest: false`). During a backtest run, all state is held in memory and nothing is written to disk.
+</Note>
+
+## How persistence works
+
+Each category of state has its own adapter singleton. On startup, the framework calls `readSignalData()` on the signal adapter. If a signal is found, monitoring resumes immediately. On every state change, the adapter's `writeValue()` is called atomically using a write-then-rename pattern that prevents file corruption even if the process is killed mid-write.
+
+Files are written to `./dump/data/<category>/` relative to the working directory, one JSON file per entity.
+
+## Default file adapter
+
+The default adapter is `PersistBase`, which writes JSON to local disk. No configuration is required — it activates automatically in live mode.
+
+```
+./dump/data/
+├── signal/          # One directory per symbol_strategy_exchange combination
+├── risk/            # Active position maps per risk profile
+├── schedule/        # Pending scheduled signals
+├── partial/         # Partial profit/loss levels per signal
+├── breakeven/       # Breakeven state per signal
+├── candle/          # Cached candle data per exchange/symbol/interval
+├── storage/         # General key-value storage
+├── notification/    # Notification history
+├── log/             # Structured log entries
+├── measure/         # Performance measurement cache
+├── interval/        # Interval-scoped state
+├── memory/          # In-memory keyed storage
+└── recent/          # Recent signal summaries
+```
+
+## Custom adapters
+
+You replace the default adapter by passing a class constructor to the corresponding `usePersist*Adapter()` method. Your class must satisfy the `IPersistBase` interface:
+
+```typescript
+interface IPersistBase<Entity> {
+  waitForInit(initial: boolean): Promise<void>;
+  readValue(entityId: string | number): Promise<Entity>;
+  hasValue(entityId: string | number): Promise<boolean>;
+  writeValue(entityId: string | number, entity: Entity): Promise<void>;
+  keys(): AsyncGenerator<string | number>;
+}
+```
+
+The simplest path is to extend `PersistBase` and override only `readValue` and `writeValue`:
+
+```typescript
+import { PersistBase, PersistSignalAdapter } from "backtest-kit";
+import { createClient } from "redis";
+
+const redis = createClient({ url: process.env.REDIS_URL });
+await redis.connect();
+
+class RedisPersist extends PersistBase {
+  async readValue(entityId: string | number) {
+    const raw = await redis.get(String(entityId));
+    if (!raw) throw new Error(`Entity ${entityId} not found`);
+    return JSON.parse(raw);
+  }
+
+  async writeValue(entityId: string | number, entity: unknown) {
+    await redis.set(String(entityId), JSON.stringify(entity));
+  }
+
+  async hasValue(entityId: string | number) {
+    return (await redis.exists(String(entityId))) === 1;
+  }
+
+  async *keys() {
+    const all = await redis.keys("*");
+    for (const key of all) {
+      yield key;
+    }
+  }
+}
+
+PersistSignalAdapter.usePersistSignalAdapter(RedisPersist);
+```
+
+<Warning>
+Register your custom adapter before calling `Live.background()` or `Live.run()`. The adapter is resolved once per strategy connection and cached for the lifetime of the process.
+</Warning>
+
+## Available adapters
+
+Each adapter manages a distinct category of state. You can customize them independently.
+
+| Adapter singleton | Method | State category |
+|---|---|---|
+| `PersistSignalAdapter` | `usePersistSignalAdapter(Ctor)` | Open signal state per symbol/strategy |
+| `PersistRiskAdapter` | `usePersistRiskAdapter(Ctor)` | Active positions per risk profile |
+| `PersistScheduleAdapter` | `usePersistScheduleAdapter(Ctor)` | Pending scheduled signals |
+| `PersistPartialAdapter` | `usePersistPartialAdapter(Ctor)` | Partial profit/loss levels per signal |
+| `PersistBreakevenAdapter` | `usePersistBreakevenAdapter(Ctor)` | Breakeven reached flags per signal |
+| `PersistCandleAdapter` | `usePersistCandleAdapter(Ctor)` | Candle data cache per exchange/symbol/interval |
+| `PersistStorageAdapter` | `usePersistStorageAdapter(Ctor)` | General key-value storage |
+| `PersistNotificationAdapter` | `usePersistNotificationAdapter(Ctor)` | Notification history |
+| `PersistLogAdapter` | `usePersistLogAdapter(Ctor)` | Structured log entries |
+| `PersistMeasureAdapter` | `usePersistMeasureAdapter(Ctor)` | Performance measurement cache |
+| `PersistIntervalAdapter` | `usePersistIntervalAdapter(Ctor)` | Interval-scoped state |
+| `PersistMemoryAdapter` | `usePersistMemoryAdapter(Ctor)` | In-memory keyed storage |
+| `PersistRecentAdapter` | `usePersistRecentAdapter(Ctor)` | Recent signal summaries |
+
+## Disabling persistence
+
+Each adapter exposes a `useDummy()` method that replaces it with a no-op implementation. All writes are silently discarded and reads always return empty state.
+
+```typescript
+import {
+  PersistSignalAdapter,
+  PersistRiskAdapter,
+  PersistScheduleAdapter,
+} from "backtest-kit";
+
+// Disable signal, risk, and schedule persistence
+PersistSignalAdapter.useDummy();
+PersistRiskAdapter.useDummy();
+PersistScheduleAdapter.useDummy();
+```
+
+<Warning>
+Disabling signal persistence in live mode means the framework cannot recover open positions after a crash. Use `useDummy()` only in environments where crash recovery is not required, such as staging or paper trading.
+</Warning>
+
+## Restoring the default adapter
+
+Each adapter also exposes a `useJson()` method that resets it to the built-in file-based `PersistBase` implementation.
+
+```typescript
+import { PersistSignalAdapter } from "backtest-kit";
+
+PersistSignalAdapter.useJson();
+```
+
+## Clearing the adapter cache
+
+Adapters memoize storage instances by key to avoid creating duplicate filesystem handles. If your process changes its working directory between runs, call `clear()` to evict the cache so new instances are created with the updated path.
+
+```typescript
+import { PersistSignalAdapter } from "backtest-kit";
+
+PersistSignalAdapter.clear();
+```

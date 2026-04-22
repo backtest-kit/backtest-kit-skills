@@ -1,0 +1,207 @@
+---
+title: "Backtest vs live trading mode: same strategy, two runners"
+description: "The same strategy code runs unchanged in both modes. Switch by choosing a different runner — your getSignal logic never needs to know which mode is active."
+---
+
+One of the core design goals of Backtest Kit is that your strategy logic is completely mode-agnostic. The `getSignal` function you write for a backtest is the exact same function that runs in production. The framework handles the difference: in backtest mode it feeds historical candles, and in live mode it calls your function against real market data on a repeating tick loop.
+
+## How the modes differ
+
+| | Backtest | Live |
+|---|---|---|
+| Time source | Iterates a pre-generated array of `Date` objects from the Frame schema | Uses `new Date()` on every tick |
+| Candle source | Historical data fetched from your exchange adapter for each timestamp | Real-time data from your exchange adapter |
+| Loop type | Finite — completes when the frame's date range is exhausted | Infinite `while (true)` with a configurable sleep between ticks |
+| Crash recovery | Not applicable (stateless) | Atomic persistence — state reloads from disk on restart |
+| Frame required | Yes — must provide a `frameName` | No — live mode has no frame |
+
+## Running a backtest
+
+Use `Backtest.background()` to run a backtest without blocking the process. It returns a stop function you can call to cancel early.
+
+```typescript
+import { Backtest, listenSignalBacktest, listenDoneBacktest } from 'backtest-kit';
+
+Backtest.background('BTCUSDT', {
+  strategyName: 'my-strategy',
+  exchangeName: 'binance',
+  frameName: '1d-test',
+});
+
+listenSignalBacktest((event) => {
+  if (event.action === 'closed') {
+    console.log(event.closeReason, event.pnl.pnlPercentage);
+  }
+});
+
+listenDoneBacktest(async (event) => {
+  await Backtest.dump(event.symbol, event.strategyName);
+});
+```
+
+You can also consume backtest results as an async generator for fine-grained control:
+
+```typescript
+import { Backtest } from 'backtest-kit';
+
+for await (const result of Backtest.run('BTCUSDT', {
+  strategyName: 'my-strategy',
+  exchangeName: 'binance',
+  frameName: '1d-test',
+})) {
+  console.log(result.action, result.pnl?.pnlPercentage);
+  if (shouldStop) break; // early termination is safe
+}
+```
+
+## Running live
+
+Use `Live.background()` to start a live trading loop. The runner calls `getSignal` on every tick, monitors open positions for TP/SL, and persists state after every change so the bot can recover from crashes.
+
+```typescript
+import { Live, listenSignalLive } from 'backtest-kit';
+
+Live.background('BTCUSDT', {
+  strategyName: 'my-strategy',
+  exchangeName: 'binance',   // no frameName in live mode
+});
+
+listenSignalLive((event) => {
+  console.log(event.action, event.symbol);
+});
+```
+
+## Switching between modes
+
+The strategy registration is identical — only the runner class changes:
+
+<Tabs>
+  <Tab title="Backtest">
+    ```typescript
+    import { addStrategySchema, addExchangeSchema, addFrameSchema, Backtest } from 'backtest-kit';
+
+    addExchangeSchema({
+      exchangeName: 'binance',
+      getCandles: async (symbol, interval, since, limit) => { /* ... */ },
+    });
+
+    addStrategySchema({
+      strategyName: 'my-strategy',
+      interval: '5m',
+      getSignal: async (symbol, when, currentPrice) => {
+        // your signal logic — same in both modes
+        return null;
+      },
+    });
+
+    addFrameSchema({
+      frameName: '1d-test',
+      interval: '1m',
+      startDate: new Date('2025-12-01'),
+      endDate: new Date('2025-12-02'),
+    });
+
+    Backtest.background('BTCUSDT', {
+      strategyName: 'my-strategy',
+      exchangeName: 'binance',
+      frameName: '1d-test',    // required in backtest mode
+    });
+    ```
+  </Tab>
+
+  <Tab title="Live">
+    ```typescript
+    import { addStrategySchema, addExchangeSchema, Live } from 'backtest-kit';
+
+    addExchangeSchema({
+      exchangeName: 'binance',
+      getCandles: async (symbol, interval, since, limit) => { /* ... */ },
+    });
+
+    addStrategySchema({
+      strategyName: 'my-strategy',  // same name as in backtest
+      interval: '5m',
+      getSignal: async (symbol, when, currentPrice) => {
+        // identical getSignal function
+        return null;
+      },
+    });
+
+    // No addFrameSchema needed for live mode
+
+    Live.background('BTCUSDT', {
+      strategyName: 'my-strategy',
+      exchangeName: 'binance',
+      // no frameName
+    });
+    ```
+  </Tab>
+</Tabs>
+
+## Checking the current mode at runtime
+
+If your strategy needs to branch on whether it is running in backtest or live mode — for example, to skip expensive external API calls during backtesting — use `getMode()`:
+
+```typescript
+import { addStrategySchema, getMode } from 'backtest-kit';
+
+addStrategySchema({
+  strategyName: 'my-strategy',
+  getSignal: async (symbol, when, currentPrice) => {
+    const mode = getMode(); // "backtest" | "live"
+
+    if (mode === 'live') {
+      // fetch real-time news sentiment, etc.
+    }
+
+    return null;
+  },
+});
+```
+
+You can also read the `backtest` boolean that is passed directly into your strategy callbacks:
+
+```typescript
+callbacks: {
+  onClose: (symbol, signal, priceClose, backtest) => {
+    if (!backtest) {
+      // send Telegram notification in live mode only
+    }
+  },
+},
+```
+
+## Crash recovery in live mode
+
+In live mode, every signal state change is written atomically to disk before the internal state is updated. If the process crashes mid-tick, the next startup reads the last persisted state and continues monitoring the open position — no trades are lost and no duplicate signals are created.
+
+<Note>
+  Crash recovery is automatic and requires no configuration. By default, state is persisted to `{strategyName}/{symbol}.json` using atomic file writes. You can swap in a custom persistence adapter (e.g. Redis) by implementing `PersistBase` and calling `PersistSignalAdapter.usePersistSignalAdapter()`.
+</Note>
+
+## Stopping a live strategy gracefully
+
+`Live.background()` returns a stop function. Calling it prevents new signals from being generated but lets any open position continue monitoring until it hits TP, SL, or `time_expired`:
+
+```typescript
+const stop = await Live.background('BTCUSDT', {
+  strategyName: 'my-strategy',
+  exchangeName: 'binance',
+});
+
+// Later, when you want to shut down:
+await stop();
+// No new signals will be generated, but open positions continue until they close naturally.
+```
+
+## Generating reports
+
+Both modes produce Markdown reports with PnL statistics, win rate, and Sharpe ratio:
+
+```typescript
+// After backtest completes
+await Backtest.dump('my-strategy', './reports');
+
+// From a running live bot
+await Live.dump('my-strategy', './reports');
+```

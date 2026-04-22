@@ -1,0 +1,827 @@
+---
+title: "Wire live exchange orders using the Broker adapter"
+description: "Implement IBroker, register it with Broker.useBrokerAdapter(), and wire order execution to a real exchange for live trading with transactional integrity."
+---
+
+The Broker adapter is the bridge between Backtest Kit's internal state machine and a real exchange. Every time the framework commits a trade mutation — opening a position, closing it, taking a partial profit, updating a trailing stop — it calls the corresponding method on your adapter **before** changing internal state. If the adapter throws, the mutation is rolled back and the framework retries automatically on the next tick.
+
+<Warning>
+The broker adapter is only invoked in live mode (`backtest: false`). During backtests, all `commit*` calls are silently skipped — the adapter never receives backtest traffic and you do not need to guard against it in your implementation.
+</Warning>
+
+## Registering the adapter
+
+Call `Broker.useBrokerAdapter()` with your adapter class or instance, then call `Broker.enable()` to subscribe to the internal event bus. Signal open and close events are routed automatically once `enable()` is called.
+
+```typescript
+import { Broker } from "backtest-kit";
+
+Broker.useBrokerAdapter(MyBroker);
+
+// Activates signal-open / signal-close routing via internal event bus
+const dispose = Broker.enable();
+
+// Later, when you want to stop receiving events:
+dispose(); // or Broker.disable()
+```
+
+<Note>
+Call `Broker.useBrokerAdapter()` before `Broker.enable()`. Calling `enable()` without a registered adapter throws immediately.
+</Note>
+
+## The IBroker interface
+
+Your adapter must implement `IBroker`. All methods are `async` and receive a typed payload. You can implement the full interface or use `Partial<IBroker>` — if a method is called but not implemented, the framework throws and rolls back the mutation.
+
+```typescript
+interface IBroker {
+  /** Called once before first use. Establish exchange connections here. */
+  waitForInit(): Promise<void>;
+
+  /** Called when a new signal is opened (position entry confirmed). */
+  onSignalOpenCommit(payload: BrokerSignalOpenPayload): Promise<void>;
+
+  /** Called when a signal is closed (take-profit, stop-loss, or manual close). */
+  onSignalCloseCommit(payload: BrokerSignalClosePayload): Promise<void>;
+
+  /** Called when a partial close at profit is committed. */
+  onPartialProfitCommit(payload: BrokerPartialProfitPayload): Promise<void>;
+
+  /** Called when a partial close at loss is committed. */
+  onPartialLossCommit(payload: BrokerPartialLossPayload): Promise<void>;
+
+  /** Called when a trailing stop-loss level is updated. */
+  onTrailingStopCommit(payload: BrokerTrailingStopPayload): Promise<void>;
+
+  /** Called when a trailing take-profit level is updated. */
+  onTrailingTakeCommit(payload: BrokerTrailingTakePayload): Promise<void>;
+
+  /** Called when the stop-loss is moved to breakeven (entry price). */
+  onBreakevenCommit(payload: BrokerBreakevenPayload): Promise<void>;
+
+  /** Called when a new DCA entry is added to the active position. */
+  onAverageBuyCommit(payload: BrokerAverageBuyPayload): Promise<void>;
+}
+```
+
+## Transactional integrity
+
+Every `commit*` method fires **before** the internal position state mutates. This gives the adapter a transaction control point:
+
+- If the adapter resolves, the mutation is applied.
+- If the adapter throws — due to an exchange rejection, a fill timeout, or a network failure — the mutation is skipped. Backtest Kit retries automatically on the next tick.
+
+This means your adapter is responsible for keeping exchange state consistent during rollbacks. For example, if a limit order partially fills before timing out, you should cancel the remainder and close the partial fill via a market order before throwing, so the position on the exchange matches what Backtest Kit expects on retry.
+
+## Using BrokerBase
+
+`BrokerBase` provides default no-op logging implementations for all `IBroker` methods. Extend it and override only the methods you need.
+
+```typescript
+import { BrokerBase, Broker, BrokerSignalOpenPayload, BrokerSignalClosePayload } from "backtest-kit";
+
+class NotifyBroker extends BrokerBase {
+  async onSignalOpenCommit(payload: BrokerSignalOpenPayload) {
+    await fetch("https://notify.example.com/open", {
+      method: "POST",
+      body: JSON.stringify({ symbol: payload.symbol, position: payload.position }),
+    });
+  }
+
+  async onSignalCloseCommit(payload: BrokerSignalClosePayload) {
+    const pnl = payload.pnl.profit - payload.pnl.loss;
+    await fetch("https://notify.example.com/close", {
+      method: "POST",
+      body: JSON.stringify({ symbol: payload.symbol, pnl }),
+    });
+  }
+}
+
+Broker.useBrokerAdapter(NotifyBroker);
+Broker.enable();
+```
+
+## Full exchange implementations
+
+The examples below show production-quality implementations for Binance Spot and Binance Futures using CCXT. Both handle fill polling, partial fill rollback, and SL/TP restoration so positions are never left unprotected during retries.
+
+<Tabs>
+  <Tab title="Spot">
+
+```typescript
+import ccxt from "ccxt";
+import { singleshot, sleep } from "functools-kit";
+import {
+  Broker,
+  IBroker,
+  BrokerSignalOpenPayload,
+  BrokerSignalClosePayload,
+  BrokerPartialProfitPayload,
+  BrokerPartialLossPayload,
+  BrokerTrailingStopPayload,
+  BrokerTrailingTakePayload,
+  BrokerBreakevenPayload,
+  BrokerAverageBuyPayload,
+} from "backtest-kit";
+
+const FILL_POLL_INTERVAL_MS = 10_000;
+const FILL_POLL_ATTEMPTS = 10;
+const CANCEL_SETTLE_MS = 2_000;
+const STOP_LIMIT_SLIPPAGE = 0.995;
+
+const getSpotExchange = singleshot(async () => {
+  const exchange = new ccxt.binance({
+    apiKey: process.env.BINANCE_API_KEY,
+    secret: process.env.BINANCE_API_SECRET,
+    options: {
+      defaultType: "spot",
+      adjustForTimeDifference: true,
+      recvWindow: 60000,
+    },
+    enableRateLimit: true,
+  });
+  await exchange.loadMarkets();
+  return exchange;
+});
+
+function getBase(exchange: ccxt.binance, symbol: string): string {
+  return exchange.markets[symbol].base;
+}
+
+function truncateQty(exchange: ccxt.binance, symbol: string, qty: number): number {
+  return parseFloat(exchange.amountToPrecision(symbol, qty, exchange.TRUNCATE));
+}
+
+async function fetchFreeQty(exchange: ccxt.binance, symbol: string): Promise<number> {
+  const balance = await exchange.fetchBalance();
+  const base    = getBase(exchange, symbol);
+  return parseFloat(String(balance?.free?.[base] ?? 0));
+}
+
+async function cancelAllOrders(exchange: ccxt.binance, orders: ccxt.Order[], symbol: string): Promise<void> {
+  await Promise.allSettled(orders.map((o) => exchange.cancelOrder(o.id, symbol)));
+}
+
+async function createStopLossOrder(
+  exchange: ccxt.binance,
+  symbol: string,
+  qty: number,
+  stopPrice: number
+): Promise<void> {
+  const limitPrice = parseFloat(exchange.priceToPrecision(symbol, stopPrice * STOP_LIMIT_SLIPPAGE));
+  await exchange.createOrder(symbol, "stop_loss_limit", "sell", qty, limitPrice, { stopPrice });
+}
+
+async function createLimitOrderAndWait(
+  exchange: ccxt.binance,
+  symbol: string,
+  side: "buy" | "sell",
+  qty: number,
+  price: number,
+  restore?: { tpPrice: number; slPrice: number }
+): Promise<void> {
+  const order = await exchange.createOrder(symbol, "limit", side, qty, price);
+
+  for (let i = 0; i < FILL_POLL_ATTEMPTS; i++) {
+    await sleep(FILL_POLL_INTERVAL_MS);
+    const status = await exchange.fetchOrder(order.id, symbol);
+    if (status.status === "closed") return;
+  }
+
+  await exchange.cancelOrder(order.id, symbol);
+  await sleep(CANCEL_SETTLE_MS);
+
+  const final     = await exchange.fetchOrder(order.id, symbol);
+  const filledQty = final.filled ?? 0;
+
+  if (filledQty > 0) {
+    const rollbackSide = side === "buy" ? "sell" : "buy";
+    await exchange.createOrder(symbol, "market", rollbackSide, filledQty);
+  }
+
+  if (restore) {
+    const remainingQty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
+    if (remainingQty > 0) {
+      await exchange.createOrder(symbol, "limit", "sell", remainingQty, restore.tpPrice);
+      await createStopLossOrder(exchange, symbol, remainingQty, restore.slPrice);
+    }
+  }
+
+  throw new Error(`Limit order [${side} ${qty} ${symbol} @ ${price}] not filled — backtest-kit will retry`);
+}
+
+Broker.useBrokerAdapter(
+  class implements IBroker {
+    async waitForInit(): Promise<void> {
+      await getSpotExchange();
+    }
+
+    async onSignalOpenCommit(payload: BrokerSignalOpenPayload): Promise<void> {
+      const { symbol, cost, priceOpen, priceTakeProfit, priceStopLoss, position } = payload;
+
+      if (position === "short") {
+        throw new Error(`SpotBrokerAdapter: short position is not supported on spot (symbol=${symbol})`);
+      }
+
+      const exchange = await getSpotExchange();
+      const qty      = truncateQty(exchange, symbol, cost / priceOpen);
+
+      if (qty <= 0) {
+        throw new Error(`Computed qty is zero for ${symbol} — cost=${cost}, price=${priceOpen}`);
+      }
+
+      const openPrice = parseFloat(exchange.priceToPrecision(symbol, priceOpen));
+      const tpPrice   = parseFloat(exchange.priceToPrecision(symbol, priceTakeProfit));
+      const slPrice   = parseFloat(exchange.priceToPrecision(symbol, priceStopLoss));
+
+      await createLimitOrderAndWait(exchange, symbol, "buy", qty, openPrice);
+
+      try {
+        await exchange.createOrder(symbol, "limit", "sell", qty, tpPrice);
+        await createStopLossOrder(exchange, symbol, qty, slPrice);
+      } catch (err) {
+        await exchange.createOrder(symbol, "market", "sell", qty);
+        throw err;
+      }
+    }
+
+    async onSignalCloseCommit(payload: BrokerSignalClosePayload): Promise<void> {
+      const { symbol, currentPrice, priceTakeProfit, priceStopLoss } = payload;
+      const exchange = await getSpotExchange();
+
+      const openOrders = await exchange.fetchOpenOrders(symbol);
+      await cancelAllOrders(exchange, openOrders, symbol);
+      await sleep(CANCEL_SETTLE_MS);
+
+      const qty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
+      if (qty === 0) return;
+
+      const closePrice = parseFloat(exchange.priceToPrecision(symbol, currentPrice));
+      const tpPrice    = parseFloat(exchange.priceToPrecision(symbol, priceTakeProfit));
+      const slPrice    = parseFloat(exchange.priceToPrecision(symbol, priceStopLoss));
+
+      await createLimitOrderAndWait(exchange, symbol, "sell", qty, closePrice, { tpPrice, slPrice });
+    }
+
+    async onPartialProfitCommit(payload: BrokerPartialProfitPayload): Promise<void> {
+      const { symbol, percentToClose, currentPrice, priceTakeProfit, priceStopLoss } = payload;
+      const exchange = await getSpotExchange();
+
+      const openOrders = await exchange.fetchOpenOrders(symbol);
+      await cancelAllOrders(exchange, openOrders, symbol);
+      await sleep(CANCEL_SETTLE_MS);
+
+      const totalQty = await fetchFreeQty(exchange, symbol);
+      if (totalQty === 0) {
+        throw new Error(`PartialProfit skipped: no open position for ${symbol}`);
+      }
+
+      const qty          = truncateQty(exchange, symbol, totalQty * (percentToClose / 100));
+      const remainingQty = truncateQty(exchange, symbol, totalQty - qty);
+      const closePrice   = parseFloat(exchange.priceToPrecision(symbol, currentPrice));
+      const tpPrice      = parseFloat(exchange.priceToPrecision(symbol, priceTakeProfit));
+      const slPrice      = parseFloat(exchange.priceToPrecision(symbol, priceStopLoss));
+
+      await createLimitOrderAndWait(exchange, symbol, "sell", qty, closePrice, { tpPrice, slPrice });
+
+      if (remainingQty > 0) {
+        try {
+          await exchange.createOrder(symbol, "limit", "sell", remainingQty, tpPrice);
+          await createStopLossOrder(exchange, symbol, remainingQty, slPrice);
+        } catch (err) {
+          await exchange.createOrder(symbol, "market", "sell", remainingQty);
+          throw err;
+        }
+      }
+    }
+
+    async onPartialLossCommit(payload: BrokerPartialLossPayload): Promise<void> {
+      const { symbol, percentToClose, currentPrice, priceTakeProfit, priceStopLoss } = payload;
+      const exchange = await getSpotExchange();
+
+      const openOrders = await exchange.fetchOpenOrders(symbol);
+      await cancelAllOrders(exchange, openOrders, symbol);
+      await sleep(CANCEL_SETTLE_MS);
+
+      const totalQty = await fetchFreeQty(exchange, symbol);
+      if (totalQty === 0) {
+        throw new Error(`PartialLoss skipped: no open position for ${symbol}`);
+      }
+
+      const qty          = truncateQty(exchange, symbol, totalQty * (percentToClose / 100));
+      const remainingQty = truncateQty(exchange, symbol, totalQty - qty);
+      const closePrice   = parseFloat(exchange.priceToPrecision(symbol, currentPrice));
+      const tpPrice      = parseFloat(exchange.priceToPrecision(symbol, priceTakeProfit));
+      const slPrice      = parseFloat(exchange.priceToPrecision(symbol, priceStopLoss));
+
+      await createLimitOrderAndWait(exchange, symbol, "sell", qty, closePrice, { tpPrice, slPrice });
+
+      if (remainingQty > 0) {
+        try {
+          await exchange.createOrder(symbol, "limit", "sell", remainingQty, tpPrice);
+          await createStopLossOrder(exchange, symbol, remainingQty, slPrice);
+        } catch (err) {
+          await exchange.createOrder(symbol, "market", "sell", remainingQty);
+          throw err;
+        }
+      }
+    }
+
+    async onTrailingStopCommit(payload: BrokerTrailingStopPayload): Promise<void> {
+      const { symbol, newStopLossPrice } = payload;
+      const exchange = await getSpotExchange();
+
+      const orders  = await exchange.fetchOpenOrders(symbol);
+      const slOrder = orders.find((o) =>
+        o.side === "sell" &&
+        ["stop_loss_limit", "stop", "STOP_LOSS_LIMIT"].includes(o.type ?? "")
+      ) ?? null;
+      if (slOrder) {
+        await exchange.cancelOrder(slOrder.id, symbol);
+        await sleep(CANCEL_SETTLE_MS);
+      }
+
+      const qty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
+      if (qty === 0) {
+        throw new Error(`TrailingStop skipped: no open position for ${symbol}`);
+      }
+
+      const slPrice = parseFloat(exchange.priceToPrecision(symbol, newStopLossPrice));
+      await createStopLossOrder(exchange, symbol, qty, slPrice);
+    }
+
+    async onTrailingTakeCommit(payload: BrokerTrailingTakePayload): Promise<void> {
+      const { symbol, newTakeProfitPrice } = payload;
+      const exchange = await getSpotExchange();
+
+      const orders  = await exchange.fetchOpenOrders(symbol);
+      const tpOrder = orders.find((o) =>
+        o.side === "sell" &&
+        ["limit", "LIMIT"].includes(o.type ?? "")
+      ) ?? null;
+      if (tpOrder) {
+        await exchange.cancelOrder(tpOrder.id, symbol);
+        await sleep(CANCEL_SETTLE_MS);
+      }
+
+      const qty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
+      if (qty === 0) {
+        throw new Error(`TrailingTake skipped: no open position for ${symbol}`);
+      }
+
+      const tpPrice = parseFloat(exchange.priceToPrecision(symbol, newTakeProfitPrice));
+      await exchange.createOrder(symbol, "limit", "sell", qty, tpPrice);
+    }
+
+    async onBreakevenCommit(payload: BrokerBreakevenPayload): Promise<void> {
+      const { symbol, newStopLossPrice } = payload;
+      const exchange = await getSpotExchange();
+
+      const orders  = await exchange.fetchOpenOrders(symbol);
+      const slOrder = orders.find((o) =>
+        o.side === "sell" &&
+        ["stop_loss_limit", "stop", "STOP_LOSS_LIMIT"].includes(o.type ?? "")
+      ) ?? null;
+      if (slOrder) {
+        await exchange.cancelOrder(slOrder.id, symbol);
+        await sleep(CANCEL_SETTLE_MS);
+      }
+
+      const qty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
+      if (qty === 0) {
+        throw new Error(`Breakeven skipped: no open position for ${symbol}`);
+      }
+
+      const slPrice = parseFloat(exchange.priceToPrecision(symbol, newStopLossPrice));
+      await createStopLossOrder(exchange, symbol, qty, slPrice);
+    }
+
+    async onAverageBuyCommit(payload: BrokerAverageBuyPayload): Promise<void> {
+      const { symbol, currentPrice, cost, priceTakeProfit, priceStopLoss } = payload;
+      const exchange = await getSpotExchange();
+
+      const openOrders = await exchange.fetchOpenOrders(symbol);
+      await cancelAllOrders(exchange, openOrders, symbol);
+      await sleep(CANCEL_SETTLE_MS);
+
+      const existing    = await fetchFreeQty(exchange, symbol);
+      const minNotional = exchange.markets[symbol].limits?.cost?.min ?? 1;
+
+      if (existing * currentPrice < minNotional) {
+        throw new Error(`AverageBuy skipped: no open position for ${symbol}`);
+      }
+
+      const qty = truncateQty(exchange, symbol, cost / currentPrice);
+      if (qty <= 0) {
+        throw new Error(`Computed qty is zero for ${symbol} — cost=${cost}, price=${currentPrice}`);
+      }
+
+      const entryPrice = parseFloat(exchange.priceToPrecision(symbol, currentPrice));
+      const tpPrice    = parseFloat(exchange.priceToPrecision(symbol, priceTakeProfit));
+      const slPrice    = parseFloat(exchange.priceToPrecision(symbol, priceStopLoss));
+
+      await createLimitOrderAndWait(exchange, symbol, "buy", qty, entryPrice, { tpPrice, slPrice });
+
+      const totalQty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
+
+      try {
+        await exchange.createOrder(symbol, "limit", "sell", totalQty, tpPrice);
+        await createStopLossOrder(exchange, symbol, totalQty, slPrice);
+      } catch (err) {
+        await exchange.createOrder(symbol, "market", "sell", totalQty);
+        throw err;
+      }
+    }
+  }
+);
+
+Broker.enable();
+```
+
+  </Tab>
+  <Tab title="Futures">
+
+```typescript
+import ccxt from "ccxt";
+import { singleshot, sleep } from "functools-kit";
+import {
+  Broker,
+  IBroker,
+  BrokerSignalOpenPayload,
+  BrokerSignalClosePayload,
+  BrokerPartialProfitPayload,
+  BrokerPartialLossPayload,
+  BrokerTrailingStopPayload,
+  BrokerTrailingTakePayload,
+  BrokerBreakevenPayload,
+  BrokerAverageBuyPayload,
+} from "backtest-kit";
+
+const FILL_POLL_INTERVAL_MS = 10_000;
+const FILL_POLL_ATTEMPTS = 10;
+const CANCEL_SETTLE_MS = 2_000;
+const FUTURES_LEVERAGE = 3;
+
+const getFuturesExchange = singleshot(async () => {
+  const exchange = new ccxt.binance({
+    apiKey: process.env.BINANCE_API_KEY,
+    secret: process.env.BINANCE_API_SECRET,
+    options: {
+      defaultType: "future",
+      adjustForTimeDifference: true,
+      recvWindow: 60000,
+    },
+    enableRateLimit: true,
+  });
+  await exchange.loadMarkets();
+  return exchange;
+});
+
+function truncateQty(exchange: ccxt.binance, symbol: string, qty: number): number {
+  return parseFloat(exchange.amountToPrecision(symbol, qty, exchange.TRUNCATE));
+}
+
+function findPosition(positions: ccxt.Position[], symbol: string, side: "long" | "short") {
+  const hedged = positions.find((p) => p.symbol === symbol && p.side === side);
+  if (hedged) return hedged;
+  return positions.find((p) => p.symbol === symbol) ?? null;
+}
+
+async function fetchContractsQty(
+  exchange: ccxt.binance,
+  symbol: string,
+  side: "long" | "short"
+): Promise<number> {
+  const positions = await exchange.fetchPositions([symbol]);
+  const pos       = findPosition(positions, symbol, side);
+  return Math.abs(parseFloat(String(pos?.contracts ?? 0)));
+}
+
+async function cancelAllOrders(exchange: ccxt.binance, orders: ccxt.Order[], symbol: string): Promise<void> {
+  await Promise.allSettled(orders.map((o) => exchange.cancelOrder(o.id, symbol)));
+}
+
+function toPositionSide(position: "long" | "short"): "LONG" | "SHORT" {
+  return position === "long" ? "LONG" : "SHORT";
+}
+
+async function createLimitOrderAndWait(
+  exchange: ccxt.binance,
+  symbol: string,
+  side: "buy" | "sell",
+  qty: number,
+  price: number,
+  params: Record<string, unknown> = {},
+  restore?: { exitSide: "buy" | "sell"; tpPrice: number; slPrice: number; positionSide: "long" | "short" }
+): Promise<void> {
+  const order = await exchange.createOrder(symbol, "limit", side, qty, price, params);
+
+  for (let i = 0; i < FILL_POLL_ATTEMPTS; i++) {
+    await sleep(FILL_POLL_INTERVAL_MS);
+    const status = await exchange.fetchOrder(order.id, symbol);
+    if (status.status === "closed") return;
+  }
+
+  await exchange.cancelOrder(order.id, symbol);
+  await sleep(CANCEL_SETTLE_MS);
+
+  const final     = await exchange.fetchOrder(order.id, symbol);
+  const filledQty = final.filled ?? 0;
+
+  if (filledQty > 0) {
+    const rollbackSide         = side === "buy" ? "sell" : "buy";
+    const rollbackPositionSide = params.positionSide ?? (restore ? toPositionSide(restore.positionSide) : undefined);
+    await exchange.createOrder(symbol, "market", rollbackSide, filledQty, undefined, {
+      reduceOnly: true,
+      ...(rollbackPositionSide ? { positionSide: rollbackPositionSide } : {}),
+    });
+  }
+
+  if (restore) {
+    const remainingQty = truncateQty(exchange, symbol, await fetchContractsQty(exchange, symbol, restore.positionSide));
+    if (remainingQty > 0) {
+      await exchange.createOrder(symbol, "limit", restore.exitSide, remainingQty, restore.tpPrice, { reduceOnly: true });
+      await exchange.createOrder(symbol, "stop_market", restore.exitSide, remainingQty, undefined, { stopPrice: restore.slPrice, reduceOnly: true });
+    }
+  }
+
+  throw new Error(`Limit order [${side} ${qty} ${symbol} @ ${price}] not filled — backtest-kit will retry`);
+}
+
+Broker.useBrokerAdapter(
+  class implements IBroker {
+    async waitForInit(): Promise<void> {
+      await getFuturesExchange();
+    }
+
+    async onSignalOpenCommit(payload: BrokerSignalOpenPayload): Promise<void> {
+      const { symbol, cost, priceOpen, priceTakeProfit, priceStopLoss, position } = payload;
+      const exchange = await getFuturesExchange();
+
+      await exchange.setLeverage(FUTURES_LEVERAGE, symbol);
+
+      const qty = truncateQty(exchange, symbol, cost / priceOpen);
+      if (qty <= 0) {
+        throw new Error(`Computed qty is zero for ${symbol} — cost=${cost}, price=${priceOpen}`);
+      }
+
+      const openPrice    = parseFloat(exchange.priceToPrecision(symbol, priceOpen));
+      const tpPrice      = parseFloat(exchange.priceToPrecision(symbol, priceTakeProfit));
+      const slPrice      = parseFloat(exchange.priceToPrecision(symbol, priceStopLoss));
+      const entrySide    = position === "long" ? "buy"  : "sell";
+      const exitSide     = position === "long" ? "sell" : "buy";
+      const positionSide = toPositionSide(position);
+
+      await createLimitOrderAndWait(exchange, symbol, entrySide, qty, openPrice, { positionSide });
+
+      try {
+        await exchange.createOrder(symbol, "limit", exitSide, qty, tpPrice, { reduceOnly: true, positionSide });
+        await exchange.createOrder(symbol, "stop_market", exitSide, qty, undefined, { stopPrice: slPrice, reduceOnly: true, positionSide });
+      } catch (err) {
+        await exchange.createOrder(symbol, "market", exitSide, qty, undefined, { reduceOnly: true, positionSide });
+        throw err;
+      }
+    }
+
+    async onSignalCloseCommit(payload: BrokerSignalClosePayload): Promise<void> {
+      const { symbol, position, currentPrice, priceTakeProfit, priceStopLoss } = payload;
+      const exchange = await getFuturesExchange();
+
+      const openOrders = await exchange.fetchOpenOrders(symbol);
+      await cancelAllOrders(exchange, openOrders, symbol);
+      await sleep(CANCEL_SETTLE_MS);
+
+      const qty      = truncateQty(exchange, symbol, await fetchContractsQty(exchange, symbol, position));
+      const exitSide = position === "long" ? "sell" : "buy";
+
+      if (qty === 0) {
+        throw new Error(`SignalClose skipped: no open position for ${symbol}`);
+      }
+
+      const closePrice = parseFloat(exchange.priceToPrecision(symbol, currentPrice));
+      const tpPrice    = parseFloat(exchange.priceToPrecision(symbol, priceTakeProfit));
+      const slPrice    = parseFloat(exchange.priceToPrecision(symbol, priceStopLoss));
+
+      await createLimitOrderAndWait(
+        exchange, symbol, exitSide, qty, closePrice,
+        { reduceOnly: true },
+        { exitSide, tpPrice, slPrice, positionSide: position }
+      );
+    }
+
+    async onPartialProfitCommit(payload: BrokerPartialProfitPayload): Promise<void> {
+      const { symbol, percentToClose, currentPrice, position, priceTakeProfit, priceStopLoss } = payload;
+      const exchange = await getFuturesExchange();
+
+      const openOrders = await exchange.fetchOpenOrders(symbol);
+      await cancelAllOrders(exchange, openOrders, symbol);
+      await sleep(CANCEL_SETTLE_MS);
+
+      const totalQty = await fetchContractsQty(exchange, symbol, position);
+      if (totalQty === 0) {
+        throw new Error(`PartialProfit skipped: no open position for ${symbol}`);
+      }
+
+      const qty          = truncateQty(exchange, symbol, totalQty * (percentToClose / 100));
+      const remainingQty = truncateQty(exchange, symbol, totalQty - qty);
+      const closePrice   = parseFloat(exchange.priceToPrecision(symbol, currentPrice));
+      const tpPrice      = parseFloat(exchange.priceToPrecision(symbol, priceTakeProfit));
+      const slPrice      = parseFloat(exchange.priceToPrecision(symbol, priceStopLoss));
+      const exitSide     = position === "long" ? "sell" : "buy";
+      const positionSide = toPositionSide(position);
+
+      await createLimitOrderAndWait(
+        exchange, symbol, exitSide, qty, closePrice,
+        { reduceOnly: true },
+        { exitSide, tpPrice, slPrice, positionSide: position }
+      );
+
+      if (remainingQty > 0) {
+        try {
+          await exchange.createOrder(symbol, "limit", exitSide, remainingQty, tpPrice, { reduceOnly: true, positionSide });
+          await exchange.createOrder(symbol, "stop_market", exitSide, remainingQty, undefined, { stopPrice: slPrice, reduceOnly: true, positionSide });
+        } catch (err) {
+          await exchange.createOrder(symbol, "market", exitSide, remainingQty, undefined, { reduceOnly: true, positionSide });
+          throw err;
+        }
+      }
+    }
+
+    async onPartialLossCommit(payload: BrokerPartialLossPayload): Promise<void> {
+      const { symbol, percentToClose, currentPrice, position, priceTakeProfit, priceStopLoss } = payload;
+      const exchange = await getFuturesExchange();
+
+      const openOrders = await exchange.fetchOpenOrders(symbol);
+      await cancelAllOrders(exchange, openOrders, symbol);
+      await sleep(CANCEL_SETTLE_MS);
+
+      const totalQty = await fetchContractsQty(exchange, symbol, position);
+      if (totalQty === 0) {
+        throw new Error(`PartialLoss skipped: no open position for ${symbol}`);
+      }
+
+      const qty          = truncateQty(exchange, symbol, totalQty * (percentToClose / 100));
+      const remainingQty = truncateQty(exchange, symbol, totalQty - qty);
+      const closePrice   = parseFloat(exchange.priceToPrecision(symbol, currentPrice));
+      const tpPrice      = parseFloat(exchange.priceToPrecision(symbol, priceTakeProfit));
+      const slPrice      = parseFloat(exchange.priceToPrecision(symbol, priceStopLoss));
+      const exitSide     = position === "long" ? "sell" : "buy";
+      const positionSide = toPositionSide(position);
+
+      await createLimitOrderAndWait(
+        exchange, symbol, exitSide, qty, closePrice,
+        { reduceOnly: true },
+        { exitSide, tpPrice, slPrice, positionSide: position }
+      );
+
+      if (remainingQty > 0) {
+        try {
+          await exchange.createOrder(symbol, "limit", exitSide, remainingQty, tpPrice, { reduceOnly: true, positionSide });
+          await exchange.createOrder(symbol, "stop_market", exitSide, remainingQty, undefined, { stopPrice: slPrice, reduceOnly: true, positionSide });
+        } catch (err) {
+          await exchange.createOrder(symbol, "market", exitSide, remainingQty, undefined, { reduceOnly: true, positionSide });
+          throw err;
+        }
+      }
+    }
+
+    async onTrailingStopCommit(payload: BrokerTrailingStopPayload): Promise<void> {
+      const { symbol, newStopLossPrice, position } = payload;
+      const exchange = await getFuturesExchange();
+
+      const orders  = await exchange.fetchOpenOrders(symbol);
+      const slOrder = orders.find((o) =>
+        !!o.reduceOnly &&
+        ["stop_market", "stop", "STOP_MARKET"].includes(o.type ?? "")
+      ) ?? null;
+      if (slOrder) {
+        await exchange.cancelOrder(slOrder.id, symbol);
+        await sleep(CANCEL_SETTLE_MS);
+      }
+
+      const qty      = truncateQty(exchange, symbol, await fetchContractsQty(exchange, symbol, position));
+      const exitSide = position === "long" ? "sell" : "buy";
+      if (qty === 0) {
+        throw new Error(`TrailingStop skipped: no open position for ${symbol}`);
+      }
+
+      const slPrice      = parseFloat(exchange.priceToPrecision(symbol, newStopLossPrice));
+      const positionSide = toPositionSide(position);
+      await exchange.createOrder(symbol, "stop_market", exitSide, qty, undefined, { stopPrice: slPrice, reduceOnly: true, positionSide });
+    }
+
+    async onTrailingTakeCommit(payload: BrokerTrailingTakePayload): Promise<void> {
+      const { symbol, newTakeProfitPrice, position } = payload;
+      const exchange = await getFuturesExchange();
+
+      const orders  = await exchange.fetchOpenOrders(symbol);
+      const tpOrder = orders.find((o) =>
+        !!o.reduceOnly &&
+        ["limit", "LIMIT"].includes(o.type ?? "")
+      ) ?? null;
+      if (tpOrder) {
+        await exchange.cancelOrder(tpOrder.id, symbol);
+        await sleep(CANCEL_SETTLE_MS);
+      }
+
+      const qty      = truncateQty(exchange, symbol, await fetchContractsQty(exchange, symbol, position));
+      const exitSide = position === "long" ? "sell" : "buy";
+      if (qty === 0) {
+        throw new Error(`TrailingTake skipped: no open position for ${symbol}`);
+      }
+
+      const tpPrice      = parseFloat(exchange.priceToPrecision(symbol, newTakeProfitPrice));
+      const positionSide = toPositionSide(position);
+      await exchange.createOrder(symbol, "limit", exitSide, qty, tpPrice, { reduceOnly: true, positionSide });
+    }
+
+    async onBreakevenCommit(payload: BrokerBreakevenPayload): Promise<void> {
+      const { symbol, newStopLossPrice, position } = payload;
+      const exchange = await getFuturesExchange();
+
+      const orders  = await exchange.fetchOpenOrders(symbol);
+      const slOrder = orders.find((o) =>
+        !!o.reduceOnly &&
+        ["stop_market", "stop", "STOP_MARKET"].includes(o.type ?? "")
+      ) ?? null;
+      if (slOrder) {
+        await exchange.cancelOrder(slOrder.id, symbol);
+        await sleep(CANCEL_SETTLE_MS);
+      }
+
+      const qty      = truncateQty(exchange, symbol, await fetchContractsQty(exchange, symbol, position));
+      const exitSide = position === "long" ? "sell" : "buy";
+      if (qty === 0) {
+        throw new Error(`Breakeven skipped: no open position for ${symbol}`);
+      }
+
+      const slPrice      = parseFloat(exchange.priceToPrecision(symbol, newStopLossPrice));
+      const positionSide = toPositionSide(position);
+      await exchange.createOrder(symbol, "stop_market", exitSide, qty, undefined, { stopPrice: slPrice, reduceOnly: true, positionSide });
+    }
+
+    async onAverageBuyCommit(payload: BrokerAverageBuyPayload): Promise<void> {
+      const { symbol, currentPrice, cost, position, priceTakeProfit, priceStopLoss } = payload;
+      const exchange = await getFuturesExchange();
+
+      const openOrders = await exchange.fetchOpenOrders(symbol);
+      await cancelAllOrders(exchange, openOrders, symbol);
+      await sleep(CANCEL_SETTLE_MS);
+
+      const existing    = await fetchContractsQty(exchange, symbol, position);
+      const minNotional = exchange.markets[symbol].limits?.cost?.min ?? 1;
+
+      if (existing * currentPrice < minNotional) {
+        throw new Error(`AverageBuy skipped: no open position for ${symbol}`);
+      }
+
+      const qty = truncateQty(exchange, symbol, cost / currentPrice);
+      if (qty <= 0) {
+        throw new Error(`Computed qty is zero for ${symbol} — cost=${cost}, price=${currentPrice}`);
+      }
+
+      const entryPrice   = parseFloat(exchange.priceToPrecision(symbol, currentPrice));
+      const tpPrice      = parseFloat(exchange.priceToPrecision(symbol, priceTakeProfit));
+      const slPrice      = parseFloat(exchange.priceToPrecision(symbol, priceStopLoss));
+      const positionSide = toPositionSide(position);
+      const entrySide    = position === "long" ? "buy"  : "sell";
+      const exitSide     = position === "long" ? "sell" : "buy";
+
+      await createLimitOrderAndWait(
+        exchange, symbol, entrySide, qty, entryPrice,
+        { positionSide },
+        { exitSide, tpPrice, slPrice, positionSide: position }
+      );
+
+      const totalQty = truncateQty(exchange, symbol, await fetchContractsQty(exchange, symbol, position));
+
+      try {
+        await exchange.createOrder(symbol, "limit", exitSide, totalQty, tpPrice, { reduceOnly: true, positionSide });
+        await exchange.createOrder(symbol, "stop_market", exitSide, totalQty, undefined, { stopPrice: slPrice, reduceOnly: true, positionSide });
+      } catch (err) {
+        await exchange.createOrder(symbol, "market", exitSide, totalQty, undefined, { reduceOnly: true, positionSide });
+        throw err;
+      }
+    }
+  }
+);
+
+Broker.enable();
+```
+
+  </Tab>
+</Tabs>
+
+## Disabling the broker
+
+Call `Broker.disable()` to unsubscribe from the event bus. You can reactivate by calling `Broker.enable()` again after registering a new adapter.
+
+```typescript
+import { Broker } from "backtest-kit";
+
+Broker.disable();
+```
+
+<Tip>
+Signal open and close events are routed automatically via the internal event bus once you call `Broker.enable()`. All other operations — `onPartialProfitCommit`, `onTrailingStopCommit`, `onBreakevenCommit`, `onAverageBuyCommit` — are intercepted explicitly by the framework before the corresponding state mutation. You do not need to wire any of these manually.
+</Tip>

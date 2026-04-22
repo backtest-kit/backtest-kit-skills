@@ -1,0 +1,172 @@
+---
+title: "Deploy a live trading bot using Backtest Kit live mode"
+description: "Switch from backtest to live mode, configure exchange API keys, handle crash recovery, and monitor signals with Live.dump() and listenSignalLive."
+---
+
+Backtest Kit uses identical strategy code in both backtest and live modes. The only change when going live is calling `Live.background` instead of `Backtest.background` and providing real API credentials to your exchange adapter. The framework handles crash recovery, atomic state persistence, and tick scheduling automatically.
+
+<Warning>
+Always paper-trade or forward-test with small amounts before running with real capital. Live mode sends orders to the exchange — mistakes in strategy logic or risk rules can result in real financial losses. Never commit API keys to version control; use environment variables.
+</Warning>
+
+## Set up API keys
+
+Store credentials in a `.env` file and load them with a tool like `dotenv`. Pass them to your CCXT instance inside `addExchangeSchema`.
+
+```bash
+# .env
+BINANCE_API_KEY=your_api_key_here
+BINANCE_API_SECRET=your_api_secret_here
+```
+
+```typescript
+import 'dotenv/config';
+import ccxt from 'ccxt';
+import { addExchangeSchema } from 'backtest-kit';
+
+addExchangeSchema({
+  exchangeName: 'binance',
+  getCandles: async (symbol, interval, since, limit) => {
+    const exchange = new ccxt.binance();
+    const ohlcv = await exchange.fetchOHLCV(
+      symbol,
+      interval,
+      since.getTime(),
+      limit
+    );
+    return ohlcv.map(([timestamp, open, high, low, close, volume]) => ({
+      timestamp, open, high, low, close, volume,
+    }));
+  },
+  formatPrice: (symbol, price) => price.toFixed(2),
+  formatQuantity: (symbol, quantity) => quantity.toFixed(8),
+});
+```
+
+<Note>
+The exchange adapter shown above only fetches candle data for signal generation — it does not place real orders. To execute orders on the exchange, you must also implement a `Broker` adapter. See the broker adapter examples in the main README for spot and futures wiring.
+</Note>
+
+## Start the live bot
+
+Replace `Backtest.background` with `Live.background`. No other change to the strategy registration code is needed.
+
+```typescript
+import { Live, listenSignalLive } from 'backtest-kit';
+
+Live.background('BTCUSDT', {
+  strategyName: 'my-strategy',
+  exchangeName: 'binance',
+});
+
+listenSignalLive(async (event) => {
+  if (event.action === 'opened') {
+    console.log('Position opened:', event.signal.id);
+  }
+  if (event.action === 'closed') {
+    console.log('Position closed:', event.closeReason, event.pnl.pnlPercentage + '%');
+    // Dump the live report after each close
+    await Live.dump(event.symbol, {
+      strategyName: event.strategyName,
+      exchangeName: event.exchangeName,
+    });
+  }
+});
+```
+
+`Live.background` returns a stop function. Call it to stop generating new signals while letting any open position close naturally through TP/SL:
+
+```typescript
+const stop = await Live.background('BTCUSDT', {
+  strategyName: 'my-strategy',
+  exchangeName: 'binance',
+});
+
+// Later — graceful shutdown
+stop();
+```
+
+## Crash recovery
+
+Live mode persists signal state to disk after every mutation using atomic file writes. The state file is stored at `{strategyName}/{symbol}.json` relative to the working directory.
+
+When the process restarts, the framework reads the last persisted state before the first tick runs. This means:
+
+- An open position is automatically resumed — the bot continues monitoring TP/SL from where it left off.
+- No duplicate signals are created.
+- No positions are abandoned without monitoring.
+
+You do not need to write any recovery code. Restarting the process is sufficient.
+
+<Note>
+Crash recovery is active only in live mode. In backtest mode, state is never written to disk.
+</Note>
+
+## Monitor all live events
+
+`listenSignalLive` receives every state transition — `opened`, `active`, `closed`, and `scheduled`. Use a `switch` or `if` chain to handle each:
+
+```typescript
+import {
+  Live,
+  listenSignalLive,
+  listenRisk,
+  listenError,
+  listenPartialProfitAvailable,
+  listenPartialLossAvailable,
+} from 'backtest-kit';
+
+listenSignalLive(async (event) => {
+  switch (event.action) {
+    case 'opened':
+      console.log('New position:', event.signal.position, '@', event.currentPrice);
+      break;
+    case 'active':
+      console.log('PNL:', event.pnl.pnlPercentage.toFixed(2) + '%');
+      break;
+    case 'closed':
+      console.log('Closed:', event.closeReason);
+      await Live.dump(event.symbol, {
+        strategyName: event.strategyName,
+        exchangeName: event.exchangeName,
+      });
+      break;
+  }
+});
+
+listenRisk((event) => {
+  console.warn('Risk rejected signal:', event.message);
+});
+
+listenError((error) => {
+  console.error('Strategy error:', error);
+});
+
+listenPartialProfitAvailable(({ symbol, price, level }) => {
+  console.log(`${symbol} reached ${level}% profit at ${price}`);
+});
+
+listenPartialLossAvailable(({ symbol, price, level }) => {
+  console.log(`${symbol} reached -${level}% loss at ${price}`);
+});
+```
+
+## Generate a report on demand
+
+`Live.dump` writes a Markdown report to `./logs/live/` by default. You can also pass a custom path:
+
+```typescript
+// Default output: ./logs/live/
+await Live.dump('BTCUSDT', { strategyName: 'my-strategy', exchangeName: 'binance' });
+
+// Custom output path
+await Live.dump('BTCUSDT', { strategyName: 'my-strategy', exchangeName: 'binance' }, './reports');
+```
+
+To read statistics without writing a file, use `Live.getData`:
+
+```typescript
+const stats = await Live.getData('my-strategy');
+console.log('Win rate:', stats.winRate);
+console.log('Avg PNL:', stats.avgPnl);
+```

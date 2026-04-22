@@ -1,0 +1,266 @@
+---
+title: "@backtest-kit/graph: compose indicator computation graphs"
+description: "Define a typed DAG of market data fetchers and derived computations. Resolve the whole graph in topological order inside any backtest-kit strategy."
+---
+
+`@backtest-kit/graph` lets you model indicator pipelines as a typed directed acyclic graph (DAG). You declare **source nodes** that fetch raw market data and **output nodes** that derive values from one or more upstream nodes. When you call `resolve()`, the graph evaluates all source nodes in parallel via `Promise.all`, then passes their typed results to each output node's `compute` function — automatically, in topological order, with no manual orchestration.
+
+## Installation
+
+```bash
+npm install @backtest-kit/graph backtest-kit
+```
+
+## Building a graph
+
+<Steps>
+  <Step title="Define source nodes">
+    A source node fetches raw data from the market. Its `fetch` function receives `(symbol, when, currentPrice, exchangeName)` from the backtest-kit execution context automatically — you don't pass these manually.
+
+    ```typescript
+    import { sourceNode } from '@backtest-kit/graph';
+    import { getCandles } from 'backtest-kit';
+
+    // SourceNode<number> — returns the latest closing price
+    const closePrice = sourceNode(async (symbol, when, currentPrice, exchangeName) => {
+      const candles = await getCandles(symbol, '1h', 1, exchangeName);
+      return candles[0].close;
+    });
+
+    // SourceNode<number> — returns the latest volume
+    const volume = sourceNode(async (symbol, when, currentPrice, exchangeName) => {
+      const candles = await getCandles(symbol, '1h', 1, exchangeName);
+      return candles[0].volume;
+    });
+    ```
+
+    TypeScript infers the generic type parameter `T` from the return type of `fetch`. Use `Cache.fn` from `backtest-kit` to memoize source nodes by candle interval, which avoids duplicate API calls when the same node is referenced by multiple output nodes.
+  </Step>
+
+  <Step title="Define output nodes">
+    An output node receives the resolved values of its upstream nodes as a typed tuple. TypeScript infers `values` types by position — no casting needed:
+
+    ```typescript
+    import { outputNode } from '@backtest-kit/graph';
+
+    // OutputNode<[SourceNode<number>, SourceNode<number>], number>
+    // price is number, vol is number — inferred from upstream nodes
+    const vwap = outputNode(
+      ([price, vol]) => price * vol,
+      closePrice,
+      volume,
+    );
+    ```
+
+    Output nodes can depend on other output nodes — the graph resolves all dependencies recursively.
+  </Step>
+
+  <Step title="Resolve the graph in a strategy">
+    Call `resolve()` inside `getSignal` to evaluate the entire graph. The return type is inferred from the root node:
+
+    ```typescript
+    import { addStrategySchema } from 'backtest-kit';
+    import { resolve } from '@backtest-kit/graph';
+
+    addStrategySchema({
+      strategyName: 'vwap-strategy',
+      interval: '1h',
+      getSignal: async (symbol) => {
+        const vwapValue = await resolve(vwap); // Promise<number>
+
+        if (vwapValue > someThreshold) {
+          return { position: 'long', /* ... */ };
+        }
+        return null;
+      },
+    });
+    ```
+  </Step>
+</Steps>
+
+## Multi-timeframe example
+
+The graph pattern is especially useful for multi-timeframe strategies. This example uses two Pine Script indicators as source nodes — the graph resolves them in parallel and applies a trend filter in the output node:
+
+```typescript
+import { extract, run, toSignalDto, File } from '@backtest-kit/pinets';
+import { addStrategySchema, Cache } from 'backtest-kit';
+import { randomString } from 'functools-kit';
+import { sourceNode, outputNode, resolve } from '@backtest-kit/graph';
+
+// SourceNode — 4h trend filter, cached per candle interval
+const higherTimeframe = sourceNode(
+  Cache.fn(
+    async (symbol) => {
+      const plots = await run(File.fromPath('timeframe_4h.pine'), {
+        symbol,
+        timeframe: '4h',
+        limit: 100,
+      });
+      return extract(plots, {
+        allowLong:  'AllowLong',
+        allowShort: 'AllowShort',
+        noTrades:   'NoTrades',
+      });
+    },
+    { interval: '4h', key: ([symbol]) => symbol },
+  ),
+);
+
+// SourceNode — 15m entry signal, cached per candle interval
+const lowerTimeframe = sourceNode(
+  Cache.fn(
+    async (symbol) => {
+      const plots = await run(File.fromPath('timeframe_15m.pine'), {
+        symbol,
+        timeframe: '15m',
+        limit: 100,
+      });
+      return extract(plots, {
+        position:            'Signal',
+        priceOpen:           'Close',
+        priceTakeProfit:     'TakeProfit',
+        priceStopLoss:       'StopLoss',
+        minuteEstimatedTime: 'EstimatedTime',
+      });
+    },
+    { interval: '15m', key: ([symbol]) => symbol },
+  ),
+);
+
+// OutputNode — applies MTF filter, returns ISignalDto or null
+const mtfSignal = outputNode(
+  async ([higher, lower]) => {
+    if (higher.noTrades) return null;
+    if (lower.position === 0) return null;
+    if (higher.allowShort && lower.position === 1) return null;
+    if (higher.allowLong && lower.position === -1) return null;
+
+    return toSignalDto(randomString(), lower, null);
+  },
+  higherTimeframe,
+  lowerTimeframe,
+);
+
+addStrategySchema({
+  strategyName: 'mtf_graph_strategy',
+  interval: '5m',
+  getSignal: (symbol) => resolve(mtfSignal),
+  actions: ['partial_profit_action', 'breakeven_action'],
+});
+```
+
+Both Pine Script nodes execute in parallel. Replacing one timeframe or adding a third filter node requires no changes to the `addStrategySchema` call.
+
+## Inline anonymous graphs
+
+You can define the entire graph as a single object literal using the `TypedNode` discriminated union — useful for one-off compositions:
+
+```typescript
+import { NodeType, TypedNode, resolve } from '@backtest-kit/graph';
+
+const signal: TypedNode = {
+  type: NodeType.OutputNode,
+  nodes: [
+    {
+      type: NodeType.SourceNode,
+      fetch: async (symbol) => {
+        // fetch 4h data
+        return { allowLong: true, allowShort: false, noTrades: false };
+      },
+    },
+    {
+      type: NodeType.SourceNode,
+      fetch: async (symbol) => {
+        // fetch 15m data
+        return { position: 1, priceOpen: 50000 };
+      },
+    },
+  ],
+  compute: ([higher, lower]) => {
+    if (higher.noTrades || lower.position === 0) return null;
+    return lower.position;
+  },
+};
+
+const result = await resolve(signal);
+```
+
+## Mixed value types
+
+TypeScript infers heterogeneous types by position in the `nodes` tuple:
+
+```typescript
+import { sourceNode, outputNode } from '@backtest-kit/graph';
+
+const price = sourceNode(async (symbol) => 42);        // SourceNode<number>
+const name  = sourceNode(async (symbol) => 'BTCUSDT'); // SourceNode<string>
+const flag  = sourceNode(async (symbol) => true);      // SourceNode<boolean>
+
+const result = outputNode(
+  ([p, n, f]) => `${n}: ${p} (active: ${f})`,
+  // p: number, n: string, f: boolean — all inferred
+  price,
+  name,
+  flag,
+);
+// OutputNode<[SourceNode<number>, SourceNode<string>, SourceNode<boolean>], string>
+```
+
+## DB serialization
+
+`serialize` flattens a graph into a `IFlatNode[]` array suitable for storage. `deserialize` reconstructs the tree from stored records. `fetch` and `compute` functions are not serialized — restore them on the application side after `deserialize`:
+
+```typescript
+import { serialize, deserialize, IFlatNode } from '@backtest-kit/graph';
+
+// Graph → flat array for DB
+const flat: IFlatNode[] = serialize([vwap]);
+// [
+//   { id: 'abc', type: 'source_node', nodeIds: [] },            // closePrice
+//   { id: 'def', type: 'source_node', nodeIds: [] },            // volume
+//   { id: 'ghi', type: 'output_node', nodeIds: ['abc', 'def'] }, // vwap
+// ]
+
+// Reconstruct graph from DB records
+const roots = deserialize(flat); // INode[]
+```
+
+## Traversal utility
+
+`deepFlat` returns all nodes in topological order (dependencies before parents), deduplicated by reference:
+
+```typescript
+import { deepFlat } from '@backtest-kit/graph';
+
+const all = deepFlat([vwap]);
+// [closePrice, volume, vwap] — dependencies first
+
+all.forEach(node => console.log(node.description));
+```
+
+## API reference
+
+| Export | Signature | Description |
+|--------|-----------|-------------|
+| `sourceNode` | `(fetch) => SourceNode<T>` | Creates a typed source node. `T` is inferred from `fetch` return type |
+| `outputNode` | `(compute, ...nodes) => OutputNode<TNodes, TResult>` | Creates a typed output node. `values` in `compute` is inferred from `nodes` |
+| `resolve` | `(node) => Promise<V>` | Recursively resolves a node graph within the backtest-kit execution context |
+| `serialize` | `(roots: INode[]) => IFlatNode[]` | Flattens a graph into a flat array for DB storage |
+| `deserialize` | `(flat: IFlatNode[]) => INode[]` | Reconstructs a node tree from a flat array |
+| `deepFlat` | `(nodes: INode[]) => INode[]` | Returns all nodes in topological order, deduplicated by reference |
+
+### Types
+
+| Type | Description |
+|------|-------------|
+| `INode` | Base runtime interface — untyped, used internally and for serialization |
+| `TypedNode` | Discriminated union of `SourceNode` and `OutputNode` — use for authoring with full IntelliSense |
+| `SourceNode<T>` | Source node type with typed `fetch` return |
+| `OutputNode<TNodes, TResult>` | Output node type with inferred `values` tuple in `compute` |
+| `IFlatNode` | Serialized node shape for DB storage |
+| `Value` | `string \| number \| boolean \| object \| null` |
+
+<Note>
+Use `TypedNode` and the builder functions (`sourceNode`, `outputNode`) for all authoring. `INode` skips generics — `values` in `compute` is typed as `Value[]` — and should only be used after `deserialize` or in DI containers where the graph is constructed at runtime.
+</Note>

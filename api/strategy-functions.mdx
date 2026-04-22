@@ -1,0 +1,505 @@
+---
+title: "Strategy context functions: candles, price, and state"
+description: "Read market data, inspect signal state, format values, and query position metrics from inside getSignal and event callbacks in Backtest Kit."
+---
+
+Strategy context functions are the read-only building blocks of every strategy. You call them from inside `getSignal` or any event callback to fetch candles, check the current date and mode, inspect the active pending signal, and measure position metrics. All functions require an active execution context and method context — calling them outside a strategy callback throws an error.
+
+---
+
+## Market data
+
+### `getCandles(symbol, interval, limit)`
+
+Fetches historical candle data backwards from the current execution context time. In backtest mode this is the simulated timestamp; in live mode it is the real-time clock.
+
+```typescript
+import { getCandles } from "backtest-kit";
+
+const candles = await getCandles("BTCUSDT", "1h", 24);
+// candles[0] → { timestamp, open, high, low, close, volume }
+```
+
+<ParamField path="symbol" type="string" required>
+  Trading pair symbol, e.g. `"BTCUSDT"`.
+</ParamField>
+
+<ParamField path="interval" type="CandleInterval" required>
+  Candle interval. Accepted values: `"1m"` `"3m"` `"5m"` `"15m"` `"30m"` `"1h"` `"2h"` `"4h"` `"6h"` `"8h"`.
+</ParamField>
+
+<ParamField path="limit" type="number" required>
+  Number of candles to fetch, counted backwards from the context timestamp.
+</ParamField>
+
+Returns `Promise<ICandleData[]>`.
+
+---
+
+### `getRawCandles(symbol, interval, limit?, sDate?, eDate?)`
+
+Flexible candle fetch that accepts explicit date boundaries in addition to a limit. All combinations guard against look-ahead bias — an `eDate` later than the execution context timestamp throws.
+
+```typescript
+import { getRawCandles } from "backtest-kit";
+
+// Last 100 candles from context time
+const candles = await getRawCandles("BTCUSDT", "1m", 100);
+
+// Candles for an explicit range
+const rangeCandles = await getRawCandles("BTCUSDT", "1h", undefined, startMs, endMs);
+```
+
+<ParamField path="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+<ParamField path="interval" type="CandleInterval" required>
+  Candle interval.
+</ParamField>
+
+<ParamField path="limit" type="number">
+  Optional number of candles. Omit when fetching by date range only.
+</ParamField>
+
+<ParamField path="sDate" type="number">
+  Optional start date in milliseconds.
+</ParamField>
+
+<ParamField path="eDate" type="number">
+  Optional end date in milliseconds. Must not exceed the current execution context timestamp.
+</ParamField>
+
+Returns `Promise<ICandleData[]>`.
+
+---
+
+### `getNextCandles(symbol, interval, limit)`
+
+Fetches candles that occur **after** the current context time. Use this in backtest mode for peek-ahead analysis; in live mode it fetches the next available candles from the exchange.
+
+```typescript
+import { getNextCandles } from "backtest-kit";
+
+const upcoming = await getNextCandles("BTCUSDT", "5m", 10);
+```
+
+<ParamField path="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+<ParamField path="interval" type="CandleInterval" required>
+  Candle interval.
+</ParamField>
+
+<ParamField path="limit" type="number" required>
+  Number of future candles to fetch.
+</ParamField>
+
+Returns `Promise<ICandleData[]>`.
+
+---
+
+### `getAveragePrice(symbol)`
+
+Returns the VWAP (Volume Weighted Average Price) computed from the last 5 one-minute candles. Falls back to a simple average of close prices when volume is zero.
+
+```typescript
+import { getAveragePrice } from "backtest-kit";
+
+const price = await getAveragePrice("BTCUSDT");
+// e.g. 50125.43
+```
+
+<ParamField path="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+Returns `Promise<number>`.
+
+---
+
+### `getOrderBook(symbol, depth?)`
+
+Fetches the current order book. In backtest mode the underlying exchange implementation may use the execution context timestamp to reconstruct a historical snapshot.
+
+```typescript
+import { getOrderBook } from "backtest-kit";
+
+const book = await getOrderBook("BTCUSDT");
+console.log(book.bids); // [{ price: "50000.00", quantity: "0.5" }, ...]
+console.log(book.asks);
+
+const deepBook = await getOrderBook("BTCUSDT", 100);
+```
+
+<ParamField path="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+<ParamField path="depth" type="number">
+  Maximum depth levels. Defaults to `CC_ORDER_BOOK_MAX_DEPTH_LEVELS` from global config.
+</ParamField>
+
+Returns `Promise<IOrderBookData>`.
+
+---
+
+### `getAggregatedTrades(symbol, limit?)`
+
+Fetches aggregated trade data backwards from the current context time. Without a `limit`, returns all trades within one `CC_AGGREGATED_TRADES_MAX_MINUTES` window. With a `limit`, paginates backwards until at least that many trades are collected.
+
+```typescript
+import { getAggregatedTrades } from "backtest-kit";
+
+const trades = await getAggregatedTrades("BTCUSDT");
+const lastFive = await getAggregatedTrades("BTCUSDT", 500);
+// trade: { id, price, qty, timestamp, isBuyerMaker }
+```
+
+<ParamField path="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+<ParamField path="limit" type="number">
+  Optional maximum number of trades to return.
+</ParamField>
+
+Returns `Promise<IAggregatedTradeData[]>`.
+
+---
+
+## Context
+
+### `getDate()`
+
+Returns the current execution date. In backtest mode this is the simulated date being processed; in live mode it is the real-time date.
+
+```typescript
+import { getDate } from "backtest-kit";
+
+const date = await getDate();
+// e.g. 2024-01-01T12:00:00.000Z
+```
+
+Returns `Promise<Date>`.
+
+---
+
+### `getTimestamp()`
+
+Returns the current execution timestamp in milliseconds.
+
+```typescript
+import { getTimestamp } from "backtest-kit";
+
+const ts = await getTimestamp();
+// e.g. 1700000000000
+```
+
+Returns `Promise<number>`.
+
+---
+
+### `getMode()`
+
+Returns the current execution mode.
+
+```typescript
+import { getMode } from "backtest-kit";
+
+const mode = await getMode();
+if (mode === "backtest") {
+  // simulation path
+}
+```
+
+Returns `Promise<"backtest" | "live">`.
+
+---
+
+### `getSymbol()`
+
+Returns the trading symbol bound to the current execution context.
+
+```typescript
+import { getSymbol } from "backtest-kit";
+
+const symbol = await getSymbol();
+// e.g. "BTCUSDT"
+```
+
+Returns `Promise<string>`.
+
+---
+
+### `getContext()`
+
+Returns the raw method context object, which includes `strategyName`, `exchangeName`, and `frameName`.
+
+```typescript
+import { getContext } from "backtest-kit";
+
+const ctx = await getContext();
+console.log(ctx.strategyName);
+```
+
+Returns `Promise<MethodContext>`.
+
+---
+
+## Formatting
+
+### `formatPrice(symbol, price)`
+
+Formats a raw price number according to the exchange's precision rules.
+
+```typescript
+import { formatPrice } from "backtest-kit";
+
+const formatted = await formatPrice("BTCUSDT", 50000.123456);
+// e.g. "50000.12"
+```
+
+<ParamField path="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+<ParamField path="price" type="number" required>
+  Raw price value to format.
+</ParamField>
+
+Returns `Promise<string>`.
+
+---
+
+### `formatQuantity(symbol, qty)`
+
+Formats a raw quantity according to the exchange's lot size rules.
+
+```typescript
+import { formatQuantity } from "backtest-kit";
+
+const formatted = await formatQuantity("BTCUSDT", 0.123456789);
+// e.g. "0.12345678"
+```
+
+<ParamField path="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+<ParamField path="qty" type="number" required>
+  Raw quantity value to format.
+</ParamField>
+
+Returns `Promise<string>`.
+
+---
+
+## Signal state
+
+### `getPendingSignal(symbol)`
+
+Returns the currently active pending signal (open position) for the strategy context, or `null` if none exists.
+
+```typescript
+import { getPendingSignal } from "backtest-kit";
+
+const pending = await getPendingSignal("BTCUSDT");
+if (pending) {
+  console.log(pending.id, pending.position, pending.priceOpen);
+}
+```
+
+Returns `Promise<IPublicSignalRow | null>`.
+
+---
+
+### `getScheduledSignal(symbol)`
+
+Returns the currently active scheduled signal (waiting for price to reach `priceOpen`), or `null` if none exists.
+
+```typescript
+import { getScheduledSignal } from "backtest-kit";
+
+const scheduled = await getScheduledSignal("BTCUSDT");
+if (scheduled) {
+  console.log("Waiting to enter at", scheduled.priceOpen);
+}
+```
+
+Returns `Promise<IPublicSignalRow | null>`.
+
+---
+
+### `hasNoPendingSignal(symbol)`
+
+Returns `true` when no pending signal is active. Use this guard before opening a new position.
+
+```typescript
+import { hasNoPendingSignal } from "backtest-kit";
+
+if (await hasNoPendingSignal("BTCUSDT")) {
+  // safe to return a new signal from getSignal
+}
+```
+
+Returns `Promise<boolean>`.
+
+---
+
+### `hasNoScheduledSignal(symbol)`
+
+Returns `true` when no scheduled signal is waiting for activation.
+
+```typescript
+import { hasNoScheduledSignal } from "backtest-kit";
+
+if (await hasNoScheduledSignal("BTCUSDT")) {
+  // safe to schedule a new signal
+}
+```
+
+Returns `Promise<boolean>`.
+
+---
+
+## Position metrics
+
+All position metric functions return `null` when no pending signal exists.
+
+### `getPositionEffectivePrice(symbol)`
+
+Returns the DCA-weighted entry price (cost-weighted harmonic mean across all accepted `commitAverageBuy` calls). Equals `priceOpen` when no DCA entries have been added.
+
+```typescript
+import { getPositionEffectivePrice } from "backtest-kit";
+
+const avgPrice = await getPositionEffectivePrice("BTCUSDT");
+```
+
+Returns `Promise<number | null>`.
+
+---
+
+### `getPositionPnlPercent(symbol)`
+
+Returns the unrealized PNL as a percentage at the current VWAP price. Accounts for partial closes, DCA entries, slippage, and fees.
+
+```typescript
+import { getPositionPnlPercent } from "backtest-kit";
+
+const pnl = await getPositionPnlPercent("BTCUSDT");
+// LONG at 100, current 105 → pnl ≈ 5
+```
+
+Returns `Promise<number | null>`.
+
+---
+
+### `getPositionPnlCost(symbol)`
+
+Returns the unrealized PNL in dollars. Calculated as `pnlPercent / 100 × totalInvestedCost`.
+
+```typescript
+import { getPositionPnlCost } from "backtest-kit";
+
+const pnlUsd = await getPositionPnlCost("BTCUSDT");
+```
+
+Returns `Promise<number | null>`.
+
+---
+
+### `getPositionInvestedCost(symbol)`
+
+Returns the total dollar cost basis invested across all DCA entries (`Σ entry.cost`). Defaults to `CC_POSITION_ENTRY_COST` per entry.
+
+```typescript
+import { getPositionInvestedCost } from "backtest-kit";
+
+const cost = await getPositionInvestedCost("BTCUSDT");
+// No DCA: 100  |  After one DCA: 200
+```
+
+Returns `Promise<number | null>`.
+
+---
+
+### `getPositionInvestedCount(symbol)`
+
+Returns the number of position entries. `1` means original entry only; increases by `1` per successful `commitAverageBuy`.
+
+```typescript
+import { getPositionInvestedCount } from "backtest-kit";
+
+const count = await getPositionInvestedCount("BTCUSDT");
+```
+
+Returns `Promise<number | null>`.
+
+---
+
+### `getPositionEntries(symbol)`
+
+Returns an array of all position entries — the initial open plus each DCA entry — with price and cost per entry.
+
+```typescript
+import { getPositionEntries } from "backtest-kit";
+
+const entries = await getPositionEntries("BTCUSDT");
+// [{ price: 43000, cost: 100 }, { price: 42000, cost: 100 }]
+```
+
+Returns `Promise<Array<{ price: number; cost: number }> | null>`.
+
+---
+
+### `getPositionPartials(symbol)`
+
+Returns an array of partial close records. Each record includes `type` (`"profit"` or `"loss"`), `percent`, `currentPrice`, `costBasisAtClose`, and `entryCountAtClose`. Returns an empty array if no partials have been executed.
+
+```typescript
+import { getPositionPartials } from "backtest-kit";
+
+const partials = await getPositionPartials("BTCUSDT");
+// [{ type: "profit", percent: 30, currentPrice: 45000, ... }]
+```
+
+Returns `Promise<PartialRecord[] | null>`.
+
+---
+
+## Latest signal
+
+### `getLatestSignal(symbol)`
+
+Returns the most recently recorded signal regardless of whether it is active or closed. Use this to implement cooldown logic after a stop-loss.
+
+```typescript
+import { getLatestSignal } from "backtest-kit";
+
+const latest = await getLatestSignal("BTCUSDT");
+if (latest && Date.now() - latest.closedAt < 4 * 60 * 60 * 1000) {
+  return; // cooldown — skip new signal for 4 hours
+}
+```
+
+Returns `Promise<IPublicSignalRow | null>`.
+
+---
+
+### `getMinutesSinceLatestSignalCreated(symbol)`
+
+Returns the number of whole minutes elapsed since the latest signal's creation timestamp. Returns `null` if no signal exists.
+
+```typescript
+import { getMinutesSinceLatestSignalCreated } from "backtest-kit";
+
+const minutes = await getMinutesSinceLatestSignalCreated("BTCUSDT");
+if (minutes !== null && minutes < 24 * 60) {
+  return; // wait 24 hours before next signal
+}
+```
+
+Returns `Promise<number | null>`.

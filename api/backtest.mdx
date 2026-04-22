@@ -1,0 +1,275 @@
+---
+title: "Backtest class: run and report historical simulations"
+description: "Use the Backtest singleton to replay strategies against historical candle data, stream closed-signal results, and generate performance reports."
+---
+
+The `Backtest` singleton is the primary entry point for historical simulation. It manages one isolated execution per `symbol × strategyName × exchangeName × frameName` combination. You stream closed signals through an async generator, or hand off execution to `background()` and receive a stop function in return.
+
+## Context object
+
+Every method that triggers execution requires a context object that identifies which registered schemas to use.
+
+<ParamField body="strategyName" type="string" required>
+  The name used when registering the strategy with `addStrategySchema()`.
+</ParamField>
+
+<ParamField body="exchangeName" type="string" required>
+  The name used when registering the exchange with `addExchangeSchema()`.
+</ParamField>
+
+<ParamField body="frameName" type="string" required>
+  The name used when registering the frame with `addFrameSchema()`. The frame defines the backtest date range and tick interval.
+</ParamField>
+
+---
+
+## `Backtest.run()`
+
+Runs a historical simulation for the given symbol and returns an async generator that yields one result per closed signal.
+
+```typescript
+Backtest.run(
+  symbol: string,
+  context: {
+    strategyName: StrategyName;
+    exchangeName: ExchangeName;
+    frameName: FrameName;
+  }
+): AsyncIterableIterator<IStrategyTickResultClosed>
+```
+
+The generator is finite — it completes when the frame's time range is exhausted. Each value emitted has `action: "closed"` and includes the close reason, PNL, and the full signal row.
+
+<ParamField body="symbol" type="string" required>
+  Trading pair symbol, e.g. `"BTCUSDT"`.
+</ParamField>
+
+<ParamField body="context" type="object" required>
+  Execution context. See [Context object](#context-object).
+</ParamField>
+
+<ResponseField name="AsyncIterableIterator<IStrategyTickResultClosed>" type="async iterator">
+  Yields one `IStrategyTickResultClosed` per completed signal. Each result includes `action`, `signal`, `closeReason`, `closeTimestamp`, `pnl`, `symbol`, `strategyName`, `exchangeName`, and `frameName`.
+</ResponseField>
+
+### Usage with `for await...of`
+
+```typescript
+import { Backtest } from "backtest-kit";
+
+for await (const result of Backtest.run("BTCUSDT", {
+  strategyName: "my-strategy",
+  exchangeName: "binance",
+  frameName: "1d-backtest",
+})) {
+  console.log(result.closeReason, result.pnl.pnlPercentage);
+}
+```
+
+---
+
+## `Backtest.background()`
+
+Runs the simulation in the background without exposing the generator. Useful when you only need side-effect callbacks (e.g. `onClose`) rather than consuming results inline.
+
+```typescript
+Backtest.background(
+  symbol: string,
+  context: {
+    strategyName: StrategyName;
+    exchangeName: ExchangeName;
+    frameName: FrameName;
+  }
+): () => void
+```
+
+Returns a synchronous stop function. Calling it halts the backtest at the next safe checkpoint. Throws if a run for the same instance is already in `"pending"` or `"rejected"` state.
+
+<ParamField body="symbol" type="string" required>
+  Trading pair symbol, e.g. `"BTCUSDT"`.
+</ParamField>
+
+<ParamField body="context" type="object" required>
+  Execution context. See [Context object](#context-object).
+</ParamField>
+
+<ResponseField name="() => void" type="function">
+  Calling this function stops signal generation and marks the instance as done.
+</ResponseField>
+
+### Usage with `background()`
+
+```typescript
+import { Backtest } from "backtest-kit";
+
+const stop = Backtest.background("BTCUSDT", {
+  strategyName: "my-strategy",
+  exchangeName: "binance",
+  frameName: "1d-backtest",
+});
+
+// Stop early if needed
+setTimeout(stop, 30_000);
+```
+
+---
+
+## `Backtest.getData()`
+
+Returns the raw statistics object accumulated during the backtest for a given symbol-strategy pair.
+
+```typescript
+Backtest.getData(
+  symbol: string,
+  context: {
+    strategyName: StrategyName;
+    exchangeName: ExchangeName;
+    frameName: FrameName;
+  }
+): Promise<BacktestStatisticsModel>
+```
+
+<ParamField body="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+<ParamField body="context" type="object" required>
+  Execution context with `strategyName`, `exchangeName`, and `frameName`.
+</ParamField>
+
+<ResponseField name="BacktestStatisticsModel" type="object">
+  Aggregated statistics including win rate, average PNL, Sharpe ratio, and per-signal detail rows.
+</ResponseField>
+
+---
+
+## `Backtest.getReport()`
+
+Generates a markdown-formatted report for the given symbol-strategy pair.
+
+```typescript
+Backtest.getReport(
+  symbol: string,
+  context: {
+    strategyName: StrategyName;
+    exchangeName: ExchangeName;
+    frameName: FrameName;
+  },
+  columns?: Columns[]
+): Promise<string>
+```
+
+<ParamField body="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+<ParamField body="context" type="object" required>
+  Execution context with `strategyName`, `exchangeName`, and `frameName`.
+</ParamField>
+
+<ParamField body="columns" type="Columns[]">
+  Optional array of column identifiers to include in the report table.
+</ParamField>
+
+<ResponseField name="string" type="string">
+  A markdown string containing a report table of all closed signals and their statistics.
+</ResponseField>
+
+---
+
+## `Backtest.dump()`
+
+Saves the markdown report to disk. The default path is `./dump/backtest/<strategyName>.md`.
+
+```typescript
+Backtest.dump(
+  symbol: string,
+  context: {
+    strategyName: StrategyName;
+    exchangeName: ExchangeName;
+    frameName: FrameName;
+  },
+  path?: string,
+  columns?: Columns[]
+): Promise<void>
+```
+
+<ParamField body="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+<ParamField body="context" type="object" required>
+  Execution context with `strategyName`, `exchangeName`, and `frameName`.
+</ParamField>
+
+<ParamField body="path" type="string">
+  Optional directory path. Defaults to `"./dump/backtest"`.
+</ParamField>
+
+<ParamField body="columns" type="Columns[]">
+  Optional column selection for the saved report.
+</ParamField>
+
+### Example
+
+```typescript
+// Save to default path: ./dump/backtest/my-strategy.md
+await Backtest.dump("BTCUSDT", {
+  strategyName: "my-strategy",
+  exchangeName: "binance",
+  frameName: "1d-backtest",
+});
+
+// Save to a custom directory
+await Backtest.dump(
+  "BTCUSDT",
+  { strategyName: "my-strategy", exchangeName: "binance", frameName: "1d-backtest" },
+  "./reports/q1"
+);
+```
+
+---
+
+## `Backtest.clear()`
+
+Clears accumulated backtest data for the given symbol-strategy pair. Call this before re-running a simulation to avoid mixing results from separate runs.
+
+```typescript
+Backtest.clear(
+  symbol: string,
+  context: {
+    strategyName: StrategyName;
+    exchangeName: ExchangeName;
+    frameName: FrameName;
+  }
+): void
+```
+
+<ParamField body="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+<ParamField body="context" type="object" required>
+  Execution context with `strategyName`, `exchangeName`, and `frameName`.
+</ParamField>
+
+---
+
+## `IStrategyTickResultClosed` fields
+
+Each value emitted by `Backtest.run()` has the following shape:
+
+| Field | Type | Description |
+|---|---|---|
+| `action` | `"closed"` | Always `"closed"` for backtest results |
+| `signal` | `IPublicSignalRow` | The full signal with entry price, TP, SL |
+| `closeReason` | `"take_profit" \| "stop_loss" \| "time_expired" \| "closed"` | Why the signal exited |
+| `closeTimestamp` | `number` | Unix ms when the signal closed |
+| `pnl` | `IStrategyPnL` | PNL with fees and slippage applied |
+| `currentPrice` | `number` | VWAP at close |
+| `strategyName` | `string` | Strategy identifier |
+| `exchangeName` | `string` | Exchange identifier |
+| `frameName` | `string` | Frame identifier |
+| `symbol` | `string` | Trading pair |
+| `backtest` | `true` | Always true in backtest mode |
+| `createdAt` | `number` | Tick creation timestamp in ms |

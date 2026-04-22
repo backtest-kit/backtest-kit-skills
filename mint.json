@@ -1,0 +1,78 @@
+{
+  "$schema": "https://mintlify.com/schema.json",
+  "name": "Backtest Kit",
+  "logo": {
+    "light": "/logo/light.svg",
+    "dark": "/logo/dark.svg"
+  },
+  "favicon": "/favicon.svg",
+  "colors": {
+    "primary": "#0D9373",
+    "light": "#07C983",
+    "dark": "#0D9373"
+  },
+  "topbarLinks": [],
+  "topbarCtaButton": {
+    "name": "npm",
+    "url": "https://www.npmjs.com/package/backtest-kit"
+  },
+  "navigation": [
+    {
+      "group": "Getting Started",
+      "pages": [
+        "index",
+        "introduction",
+        "quickstart",
+        "project-scaffold"
+      ]
+    },
+    {
+      "group": "Concepts",
+      "pages": [
+        "concepts/schemas",
+        "concepts/signal-lifecycle",
+        "concepts/execution-modes",
+        "concepts/risk-management"
+      ]
+    },
+    {
+      "group": "Configuration",
+      "pages": [
+        "configuration/global-config",
+        "configuration/broker-adapter",
+        "configuration/persistance"
+      ]
+    },
+    {
+      "group": "Guides",
+      "pages": [
+        "guides/fist-backtest",
+        "guides/live-trading",
+        "guides/ai-strategies",
+        "guides/position-sizing",
+        "guides/reporting"
+      ]
+    },
+    {
+      "group": "API Reference",
+      "pages": [
+        "api/backtest",
+        "api/live",
+        "api/walker",
+        "api/schemas",
+        "api/strategy-functions",
+        "api/commit-functions",
+        "api/event-listeners",
+        {
+          "group": "Packages",
+          "pages": [
+            "api/packages/cli",
+            "api/packages/graph",
+            "api/packages/ollama"
+          ]
+        }
+      ]
+    }
+  ],
+  "footerSocials": {}
+}

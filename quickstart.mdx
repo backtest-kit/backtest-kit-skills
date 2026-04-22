@@ -1,0 +1,297 @@
+---
+title: "Backtest Kit quickstart: install and run in minutes"
+description: "Install Backtest Kit, register exchange, strategy, and frame schemas, then run your first backtest against one day of historical BTC/USDT candle data."
+---
+
+This guide walks you through the manual installation path. You install the `backtest-kit` package directly, register the four core schemas — exchange, risk, frame, and strategy — and call `Backtest.background()` to run a historical simulation. By the end you will have a working backtest that prints trade signals and generates a report.
+
+<Note>
+  If you want a pre-wired project with all schemas, scripts, and dashboard already configured, use the scaffold path instead: [Scaffold a Backtest Kit project](/project-scaffold).
+</Note>
+
+<Steps>
+  <Step title="Install dependencies">
+    Install `backtest-kit` and `ccxt`. CCXT provides the exchange connectivity that your exchange schema will use to fetch historical candles.
+
+    ```bash
+    npm install backtest-kit ccxt
+    ```
+  </Step>
+
+  <Step title="Configure logging and global settings">
+    Call `setLogger` to wire up the Backtest Kit logger to your console. Call `setConfig` to override defaults like slippage, fees, and signal timeout. Both calls are optional — skip them to use the built-in defaults.
+
+    ```typescript
+    import { setLogger, setConfig } from 'backtest-kit';
+
+    setLogger({
+      log: console.log,
+      debug: console.debug,
+      info: console.info,
+      warn: console.warn,
+    });
+
+    setConfig({
+      CC_PERCENT_SLIPPAGE: 0.1,       // % slippage applied to fills
+      CC_PERCENT_FEE: 0.1,            // % commission per trade
+      CC_SCHEDULE_AWAIT_MINUTES: 120, // pending signal timeout
+    });
+    ```
+  </Step>
+
+  <Step title="Register the exchange schema">
+    An exchange schema defines how Backtest Kit fetches candle data and formats prices and quantities. Register one with `addExchangeSchema`.
+
+    ```typescript
+    import ccxt from 'ccxt';
+    import { addExchangeSchema } from 'backtest-kit';
+
+    addExchangeSchema({
+      exchangeName: 'binance',
+      getCandles: async (symbol, interval, since, limit) => {
+        const exchange = new ccxt.binance();
+        const ohlcv = await exchange.fetchOHLCV(
+          symbol,
+          interval,
+          since.getTime(),
+          limit
+        );
+        return ohlcv.map(([timestamp, open, high, low, close, volume]) => ({
+          timestamp, open, high, low, close, volume,
+        }));
+      },
+      formatPrice: (symbol, price) => price.toFixed(2),
+      formatQuantity: (symbol, quantity) => quantity.toFixed(8),
+    });
+    ```
+  </Step>
+
+  <Step title="Register a risk schema">
+    A risk schema defines validation functions that run on every pending signal before Backtest Kit opens a position. Throw an error to reject the signal.
+
+    ```typescript
+    import { addRiskSchema } from 'backtest-kit';
+
+    addRiskSchema({
+      riskName: 'demo',
+      validations: [
+        // Require at least 1% distance to take-profit
+        ({ pendingSignal, currentPrice }) => {
+          const { priceOpen = currentPrice, priceTakeProfit, position } = pendingSignal;
+          const tpDistance =
+            position === 'long'
+              ? ((priceTakeProfit - priceOpen) / priceOpen) * 100
+              : ((priceOpen - priceTakeProfit) / priceOpen) * 100;
+          if (tpDistance < 1) {
+            throw new Error(`TP too close: ${tpDistance.toFixed(2)}%`);
+          }
+        },
+        // Require at least 2:1 reward-to-risk ratio
+        ({ pendingSignal, currentPrice }) => {
+          const { priceOpen = currentPrice, priceTakeProfit, priceStopLoss, position } = pendingSignal;
+          const reward =
+            position === 'long' ? priceTakeProfit - priceOpen : priceOpen - priceTakeProfit;
+          const risk =
+            position === 'long' ? priceOpen - priceStopLoss : priceStopLoss - priceOpen;
+          if (reward / risk < 2) {
+            throw new Error('Poor R/R ratio');
+          }
+        },
+      ],
+    });
+    ```
+  </Step>
+
+  <Step title="Register a frame schema">
+    A frame schema defines the historical time window for a backtest. Set `interval` to the granularity of the candle replay, and `startDate` / `endDate` to the period you want to test.
+
+    ```typescript
+    import { addFrameSchema } from 'backtest-kit';
+
+    addFrameSchema({
+      frameName: '1d-test',
+      interval: '1m',
+      startDate: new Date('2025-12-01'),
+      endDate: new Date('2025-12-02'),
+    });
+    ```
+  </Step>
+
+  <Step title="Register a strategy schema">
+    A strategy schema defines your signal logic. Backtest Kit calls `getSignal` on every candle tick. Return a signal object to open a position, or `null` to do nothing.
+
+    ```typescript
+    import { addStrategySchema, getCandles } from 'backtest-kit';
+
+    addStrategySchema({
+      strategyName: 'my-strategy',
+      interval: '15m',
+      riskName: 'demo',
+      getSignal: async (symbol) => {
+        // Fetch the last 48 candles at the 15-minute interval
+        const candles = await getCandles(symbol, '15m', 48);
+        const latest = candles[candles.length - 1];
+
+        // Replace this logic with your real entry condition
+        if (latest.close > latest.open) {
+          return {
+            position: 'long',
+            priceOpen: latest.close,
+            priceTakeProfit: latest.close * 1.03,
+            priceStopLoss: latest.close * 0.985,
+          };
+        }
+
+        return null;
+      },
+    });
+    ```
+  </Step>
+
+  <Step title="Run the backtest">
+    Call `Backtest.background` to start a backtest run. Listen to `listenSignalBacktest` for trade events, and call `Backtest.dump` when the run completes to generate a Markdown report.
+
+    ```typescript
+    import { Backtest, listenSignalBacktest, listenDoneBacktest } from 'backtest-kit';
+
+    Backtest.background('BTCUSDT', {
+      strategyName: 'my-strategy',
+      exchangeName: 'binance',
+      frameName: '1d-test',
+    });
+
+    listenSignalBacktest((event) => {
+      console.log('[signal]', event);
+    });
+
+    listenDoneBacktest(async (event) => {
+      console.log('[done]', event.symbol, event.strategyName);
+      await Backtest.dump(event.symbol, event.strategyName);
+    });
+    ```
+
+    When the backtest completes, Backtest Kit writes a report to `./dump/` containing PnL, Sharpe ratio, win rate, and per-trade details.
+  </Step>
+</Steps>
+
+## Complete example
+
+The following file combines all six steps into a single runnable script.
+
+```typescript
+import ccxt from 'ccxt';
+import {
+  setLogger,
+  setConfig,
+  addExchangeSchema,
+  addRiskSchema,
+  addFrameSchema,
+  addStrategySchema,
+  getCandles,
+  Backtest,
+  listenSignalBacktest,
+  listenDoneBacktest,
+} from 'backtest-kit';
+
+// Step 1 — logging
+setLogger({
+  log: console.log,
+  debug: console.debug,
+  info: console.info,
+  warn: console.warn,
+});
+
+// Step 2 — global config
+setConfig({
+  CC_PERCENT_SLIPPAGE: 0.1,
+  CC_PERCENT_FEE: 0.1,
+  CC_SCHEDULE_AWAIT_MINUTES: 120,
+});
+
+// Step 3 — exchange
+addExchangeSchema({
+  exchangeName: 'binance',
+  getCandles: async (symbol, interval, since, limit) => {
+    const exchange = new ccxt.binance();
+    const ohlcv = await exchange.fetchOHLCV(symbol, interval, since.getTime(), limit);
+    return ohlcv.map(([timestamp, open, high, low, close, volume]) => ({
+      timestamp, open, high, low, close, volume,
+    }));
+  },
+  formatPrice: (symbol, price) => price.toFixed(2),
+  formatQuantity: (symbol, quantity) => quantity.toFixed(8),
+});
+
+// Step 4 — risk rules
+addRiskSchema({
+  riskName: 'demo',
+  validations: [
+    ({ pendingSignal, currentPrice }) => {
+      const { priceOpen = currentPrice, priceTakeProfit, position } = pendingSignal;
+      const tpDistance =
+        position === 'long'
+          ? ((priceTakeProfit - priceOpen) / priceOpen) * 100
+          : ((priceOpen - priceTakeProfit) / priceOpen) * 100;
+      if (tpDistance < 1) throw new Error(`TP too close: ${tpDistance.toFixed(2)}%`);
+    },
+    ({ pendingSignal, currentPrice }) => {
+      const { priceOpen = currentPrice, priceTakeProfit, priceStopLoss, position } = pendingSignal;
+      const reward = position === 'long' ? priceTakeProfit - priceOpen : priceOpen - priceTakeProfit;
+      const risk = position === 'long' ? priceOpen - priceStopLoss : priceStopLoss - priceOpen;
+      if (reward / risk < 2) throw new Error('Poor R/R ratio');
+    },
+  ],
+});
+
+// Step 5 — backtest frame
+addFrameSchema({
+  frameName: '1d-test',
+  interval: '1m',
+  startDate: new Date('2025-12-01'),
+  endDate: new Date('2025-12-02'),
+});
+
+// Step 6 — strategy
+addStrategySchema({
+  strategyName: 'my-strategy',
+  interval: '15m',
+  riskName: 'demo',
+  getSignal: async (symbol) => {
+    const candles = await getCandles(symbol, '15m', 48);
+    const latest = candles[candles.length - 1];
+    if (latest.close > latest.open) {
+      return {
+        position: 'long',
+        priceOpen: latest.close,
+        priceTakeProfit: latest.close * 1.03,
+        priceStopLoss: latest.close * 0.985,
+      };
+    }
+    return null;
+  },
+});
+
+// Step 7 — run
+Backtest.background('BTCUSDT', {
+  strategyName: 'my-strategy',
+  exchangeName: 'binance',
+  frameName: '1d-test',
+});
+
+listenSignalBacktest((event) => console.log('[signal]', event));
+
+listenDoneBacktest(async (event) => {
+  await Backtest.dump(event.symbol, event.strategyName);
+});
+```
+
+## What to do next
+
+<CardGroup cols={2}>
+  <Card title="Scaffold a project" icon="hammer" href="/project-scaffold">
+    Use the CLI or Sidekick to generate a complete project with exchange wiring, frame definitions, and dashboard support.
+  </Card>
+  <Card title="Learn about schemas" icon="book" href="/concepts/schemas">
+    Understand all four schema types and how they compose to build a full trading system.
+  </Card>
+</CardGroup>

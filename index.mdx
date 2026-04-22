@@ -1,0 +1,57 @@
+---
+id: index
+slug: /
+title: "Backtest Kit: TypeScript trading strategy framework"
+description: "Write a trading strategy once and run it as a historical backtest or a live bot — with crash-safe persistence, AI signal generation, and rich order types."
+---
+
+Backtest Kit is a TypeScript framework for building, testing, and deploying algorithmic trading strategies. Write your strategy logic once and switch between historical backtesting and live execution without changing a line of code. Built-in crash recovery, signal validation, and automatic reporting make it production-ready from day one.
+
+<CardGroup cols={2}>
+  <Card title="Quick Start" icon="rocket" href="/quickstart">
+    Install Backtest Kit and run your first backtest in minutes.
+  </Card>
+  <Card title="Project Scaffold" icon="hammer" href="/project-scaffold">
+    Scaffold a full project with the CLI or Sidekick generator.
+  </Card>
+  <Card title="Core Concepts" icon="book" href="/concepts/schemas">
+    Learn about schemas, signal lifecycle, and execution modes.
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/backtest">
+    Explore the full public API — Backtest, Live, Walker, and more.
+  </Card>
+</CardGroup>
+
+## Why Backtest Kit?
+
+<CardGroup cols={2}>
+  <Card title="One codebase, two modes" icon="arrows-rotate">
+    The same strategy runs in backtest and live mode. Switch with a single config flag — no duplicate code.
+  </Card>
+  <Card title="Crash-safe by default" icon="shield-halved">
+    Atomic file persistence recovers live bot state after a crash. No lost trades, no duplicate signals.
+  </Card>
+  <Card title="AI strategy generation" icon="robot">
+    Integrate LLMs (OpenAI, Claude, DeepSeek, Ollama) to generate trading signals from market data and news.
+  </Card>
+  <Card title="Rich order types" icon="chart-line">
+    Market, limit, TP/SL, OCO, trailing stops, breakeven, DCA, and partial profit/loss — all with accurate PnL.
+  </Card>
+</CardGroup>
+
+## Get started in 3 steps
+
+<Steps>
+  <Step title="Install the package">
+    ```bash
+    npm install backtest-kit ccxt
+    ```
+    Or scaffold a full project instantly with the CLI.
+  </Step>
+  <Step title="Register your schemas">
+    Define your exchange data source, strategy logic, timeframe, and risk rules using the `add*Schema` functions.
+  </Step>
+  <Step title="Run a backtest or go live">
+    Call `Backtest.background()` to simulate on historical data, or `Live.background()` to start a live trading bot.
+  </Step>
+</Steps>

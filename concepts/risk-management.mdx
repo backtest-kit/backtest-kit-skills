@@ -1,0 +1,230 @@
+---
+title: "Risk management: signal validation and position limits"
+description: "Backtest Kit validates every signal before opening a position. Add custom rules to enforce TP distance, reward-to-risk ratios, and portfolio-level limits."
+---
+
+Risk management in Backtest Kit runs in two layers. The first layer is built-in: before any signal is accepted, the framework checks that prices are positive, that TP and SL are on the correct side of the entry price, and that minimum distance thresholds are respected. The second layer is yours: you attach custom validation functions to a Risk schema and link that schema to your strategy.
+
+## Built-in signal validation
+
+Every signal returned by `getSignal` goes through an automatic validation step before it can open a position. This validation checks:
+
+- All price fields (`priceOpen`, `priceTakeProfit`, `priceStopLoss`) must be positive numbers
+- For a `long` position: `priceTakeProfit` must be above `priceOpen`, and `priceStopLoss` must be below `priceOpen`
+- For a `short` position: `priceTakeProfit` must be below `priceOpen`, and `priceStopLoss` must be above `priceOpen`
+- `minuteEstimatedTime` and the signal creation timestamp must be positive
+
+<Warning>
+  Signals that fail built-in validation are silently rejected — no error is thrown and the strategy does not crash. The `getSignal` result is discarded and the strategy stays idle until the next tick. Subscribe to `listenValidation` if you need to observe rejections.
+</Warning>
+
+The global config also enforces distance floors and a ceiling on SL distance:
+
+```typescript
+import { setConfig } from 'backtest-kit';
+
+setConfig({
+  CC_MIN_TAKEPROFIT_DISTANCE_PERCENT: 0.5,  // TP must be at least 0.5% from entry
+  CC_MIN_STOPLOSS_DISTANCE_PERCENT: 0.5,    // SL must be at least 0.5% from entry
+  CC_MAX_STOPLOSS_DISTANCE_PERCENT: 20,     // SL cannot be more than 20% from entry
+});
+```
+
+## Adding a Risk schema
+
+Use `addRiskSchema` to define your own validation rules. Each entry in the `validations` array is either a plain function or an object with a `validate` function and an optional `note`.
+
+```typescript
+import { addRiskSchema } from 'backtest-kit';
+
+addRiskSchema({
+  riskName: 'demo',
+  validations: [
+    // TP at least 1% from entry
+    ({ pendingSignal, currentPrice }) => {
+      const { priceOpen = currentPrice, priceTakeProfit, position } = pendingSignal;
+      const tpDistance = position === 'long'
+        ? ((priceTakeProfit - priceOpen) / priceOpen) * 100
+        : ((priceOpen - priceTakeProfit) / priceOpen) * 100;
+      if (tpDistance < 1) throw new Error(`TP too close: ${tpDistance.toFixed(2)}%`);
+    },
+    // R/R ratio at least 2:1
+    ({ pendingSignal, currentPrice }) => {
+      const { priceOpen = currentPrice, priceTakeProfit, priceStopLoss, position } = pendingSignal;
+      const reward = position === 'long' ? priceTakeProfit - priceOpen : priceOpen - priceTakeProfit;
+      const risk   = position === 'long' ? priceOpen - priceStopLoss : priceStopLoss - priceOpen;
+      if (reward / risk < 2) throw new Error('Poor R/R ratio');
+    },
+  ],
+});
+```
+
+Link the risk profile to your strategy by setting `riskName` in the strategy schema:
+
+```typescript
+addStrategySchema({
+  strategyName: 'my-strategy',
+  riskName: 'demo',
+  getSignal: async (symbol, when, currentPrice) => { /* ... */ },
+});
+```
+
+You can also assign multiple risk profiles to a single strategy using `riskList`:
+
+```typescript
+addStrategySchema({
+  strategyName: 'my-strategy',
+  riskList: ['portfolio-limits', 'rr-filter', 'time-window'],
+  getSignal: async (symbol, when, currentPrice) => { /* ... */ },
+});
+```
+
+## The validation payload
+
+Each validation function receives an `IRiskValidationPayload` object:
+
+```typescript
+export interface IRiskValidationPayload {
+  symbol: string;
+  currentSignal: IRiskSignalRow;    // the signal being evaluated, with priceOpen resolved
+  strategyName: string;
+  exchangeName: string;
+  riskName: string;
+  frameName: string;
+  currentPrice: number;
+  timestamp: number;
+  activePositionCount: number;      // total open positions across all strategies
+  activePositions: IRiskActivePosition[];  // details of each open position
+}
+```
+
+The `currentSignal` field is an `IRiskSignalRow`, which always has a resolved `priceOpen` (the current VWAP if the signal did not specify one), so your validation functions do not need to handle the optional case.
+
+## Multi-position coordination with `IRiskActivePosition`
+
+The `activePositions` array lets you inspect every currently open position across all strategies and symbols. Use it to enforce portfolio-level limits:
+
+```typescript
+addRiskSchema({
+  riskName: 'portfolio-limits',
+  validations: [
+    // No more than 3 open positions at once
+    ({ activePositionCount }) => {
+      if (activePositionCount >= 3) {
+        throw new Error(`Max positions reached: ${activePositionCount}`);
+      }
+    },
+    // No two positions in the same direction on the same symbol
+    ({ activePositions, currentSignal, symbol }) => {
+      const sameSymbolOppositeDirection = activePositions.some(
+        (pos) => pos.symbol === symbol && pos.position === currentSignal.position
+      );
+      if (sameSymbolOppositeDirection) {
+        throw new Error(`Already have a ${currentSignal.position} on ${symbol}`);
+      }
+    },
+  ],
+});
+```
+
+Each `IRiskActivePosition` contains:
+
+```typescript
+export interface IRiskActivePosition {
+  strategyName: string;
+  exchangeName: string;
+  frameName: string;
+  symbol: string;
+  position: "long" | "short";
+  priceOpen: number;
+  priceStopLoss: number;
+  priceTakeProfit: number;
+  minuteEstimatedTime: number;
+  openTimestamp: number;
+}
+```
+
+## Validation return values
+
+A validation function can signal rejection in three ways:
+
+| Return value | Meaning |
+|---|---|
+| `void` / `null` | Validation passed — signal is allowed |
+| Throws `Error` | Signal rejected — the error message is logged as the rejection reason |
+| Returns `{ id, note }` | Signal rejected — structured rejection with optional ID |
+
+## Monitoring rejections
+
+Subscribe to `listenRisk` to receive an event every time a signal is rejected by your risk rules:
+
+```typescript
+import { listenRisk } from 'backtest-kit';
+
+listenRisk((event) => {
+  console.log(`Signal rejected on ${event.symbol}: ${event.rejectionNote}`);
+});
+```
+
+You can also add lifecycle callbacks directly to the risk schema:
+
+```typescript
+addRiskSchema({
+  riskName: 'demo',
+  validations: [/* ... */],
+  callbacks: {
+    onRejected: (symbol, params) => {
+      console.warn(`Rejected signal on ${symbol} at price ${params.currentPrice}`);
+    },
+    onAllowed: (symbol, params) => {
+      console.log(`Signal allowed on ${symbol}`);
+    },
+  },
+});
+```
+
+<Tip>
+  During backtesting, rejected signals show up in the risk report. Run `Backtest.dump()` after your backtest completes to generate a Markdown report that includes a rejection summary — useful for tuning your validation thresholds.
+</Tip>
+
+<AccordionGroup>
+  <Accordion title="Using the object form for validations">
+    Wrap a validation in an object to attach a documentation note. This note appears in logs and reports:
+
+    ```typescript
+    addRiskSchema({
+      riskName: 'demo',
+      validations: [
+        {
+          note: 'Enforce minimum R/R ratio of 2:1',
+          validate: ({ pendingSignal, currentPrice }) => {
+            const { priceOpen = currentPrice, priceTakeProfit, priceStopLoss, position } = pendingSignal;
+            const reward = position === 'long' ? priceTakeProfit - priceOpen : priceOpen - priceTakeProfit;
+            const risk   = position === 'long' ? priceOpen - priceStopLoss : priceStopLoss - priceOpen;
+            if (reward / risk < 2) throw new Error('Poor R/R ratio');
+          },
+        },
+      ],
+    });
+    ```
+  </Accordion>
+
+  <Accordion title="Time-window restrictions">
+    Combine the `timestamp` field with your own logic to restrict trading to specific hours:
+
+    ```typescript
+    addRiskSchema({
+      riskName: 'market-hours',
+      validations: [
+        ({ timestamp }) => {
+          const hour = new Date(timestamp).getUTCHours();
+          // Only trade between 08:00 and 20:00 UTC
+          if (hour < 8 || hour >= 20) {
+            throw new Error(`Outside trading hours: ${hour}:00 UTC`);
+          }
+        },
+      ],
+    });
+    ```
+  </Accordion>
+</AccordionGroup>

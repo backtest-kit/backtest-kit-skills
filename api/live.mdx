@@ -1,0 +1,275 @@
+---
+title: "Live class: start and manage real-time trading bots"
+description: "Use the Live singleton to run infinite real-time trading loops with crash recovery, signal streaming, and markdown report generation."
+---
+
+The `Live` singleton is the counterpart to `Backtest` for production use. It manages one execution per `symbol × strategyName × exchangeName` combination. Unlike `Backtest`, the generator returned by `Live.run()` is **infinite** — it never completes on its own. The framework uses `Date.now()` for real-time tick progression, and restores any open position from disk after a process restart.
+
+## How `Live` differs from `Backtest`
+
+| Aspect | `Backtest` | `Live` |
+|---|---|---|
+| Generator | Finite — ends when frame exhausted | Infinite — runs until stopped |
+| Time source | Frame timestamps | `new Date()` (real-time) |
+| Frame required | Yes (`frameName`) | No (`frameName` is omitted) |
+| Crash recovery | Not applicable | Restores pending signal from disk |
+| Tick results | Only `closed` | All actions: `opened`, `closed`, and more |
+
+## Context object
+
+Live methods accept a context object with two fields (no `frameName`).
+
+<ParamField body="strategyName" type="string" required>
+  The name used when registering the strategy with `addStrategySchema()`.
+</ParamField>
+
+<ParamField body="exchangeName" type="string" required>
+  The name used when registering the exchange with `addExchangeSchema()`.
+</ParamField>
+
+---
+
+## `Live.run()`
+
+Runs a live trading loop for the given symbol. Returns an infinite async generator that yields a result on every signal event.
+
+```typescript
+Live.run(
+  symbol: string,
+  context: {
+    strategyName: StrategyName;
+    exchangeName: ExchangeName;
+  }
+): AsyncIterableIterator<IStrategyTickResult>
+```
+
+The generator yields `opened` results when a new position is created and `closed` results when a position exits. `idle` and `active` ticks are consumed internally and not yielded, so your `for await` loop only wakes up on meaningful events.
+
+<ParamField body="symbol" type="string" required>
+  Trading pair symbol, e.g. `"BTCUSDT"`.
+</ParamField>
+
+<ParamField body="context" type="object" required>
+  Live context. See [Context object](#context-object).
+</ParamField>
+
+<ResponseField name="AsyncIterableIterator<IStrategyTickResult>" type="async iterator">
+  Yields `IStrategyTickResultOpened` and `IStrategyTickResultClosed`. Use `result.action` to distinguish them.
+</ResponseField>
+
+### Usage with `for await...of`
+
+```typescript
+import { Live } from "backtest-kit";
+
+// This loop runs indefinitely — use process signals or break to exit
+for await (const result of Live.run("BTCUSDT", {
+  strategyName: "my-strategy",
+  exchangeName: "binance",
+})) {
+  if (result.action === "opened") {
+    console.log("Position opened:", result.signal.position);
+  } else if (result.action === "closed") {
+    console.log("Position closed:", result.closeReason, result.pnl.pnlPercentage);
+  }
+}
+```
+
+---
+
+## `Live.background()`
+
+Runs the live loop in the background without exposing the generator. Returns a synchronous stop function.
+
+```typescript
+Live.background(
+  symbol: string,
+  context: {
+    strategyName: StrategyName;
+    exchangeName: ExchangeName;
+  }
+): () => void
+```
+
+When you call the returned function, the framework signals the strategy to stop generating new signals. Any currently open position continues to be monitored until it closes naturally (TP, SL, or time expiry). Throws if a background task for the same instance is already running or has failed.
+
+<ParamField body="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+<ParamField body="context" type="object" required>
+  Live context. See [Context object](#context-object).
+</ParamField>
+
+<ResponseField name="() => void" type="function">
+  Calling this stops signal generation. Open positions continue until natural closure.
+</ResponseField>
+
+### Usage with `background()`
+
+```typescript
+import { Live } from "backtest-kit";
+
+const stop = Live.background("BTCUSDT", {
+  strategyName: "my-strategy",
+  exchangeName: "binance",
+});
+
+// Graceful shutdown on SIGINT
+process.on("SIGINT", () => {
+  stop();
+});
+```
+
+---
+
+## `Live.getData()`
+
+Returns the raw statistics object accumulated during the live session for a given symbol-strategy pair.
+
+```typescript
+Live.getData(
+  symbol: string,
+  context: {
+    strategyName: StrategyName;
+    exchangeName: ExchangeName;
+  }
+): Promise<LiveStatisticsModel>
+```
+
+<ParamField body="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+<ParamField body="context" type="object" required>
+  Live context with `strategyName` and `exchangeName`.
+</ParamField>
+
+<ResponseField name="LiveStatisticsModel" type="object">
+  Aggregated statistics including all signal events, win rate, and average PNL per closed signal.
+</ResponseField>
+
+---
+
+## `Live.getReport()`
+
+Generates a markdown-formatted report for the given symbol-strategy pair.
+
+```typescript
+Live.getReport(
+  symbol: string,
+  context: {
+    strategyName: StrategyName;
+    exchangeName: ExchangeName;
+  },
+  columns?: Columns[]
+): Promise<string>
+```
+
+<ParamField body="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+<ParamField body="context" type="object" required>
+  Live context with `strategyName` and `exchangeName`.
+</ParamField>
+
+<ParamField body="columns" type="Columns[]">
+  Optional column selection for the report table.
+</ParamField>
+
+<ResponseField name="string" type="string">
+  A markdown string containing a table of all accumulated signal events and statistics.
+</ResponseField>
+
+---
+
+## `Live.dump()`
+
+Saves the markdown report to disk. The default path is `./dump/live/<strategyName>.md`.
+
+```typescript
+Live.dump(
+  symbol: string,
+  context: {
+    strategyName: StrategyName;
+    exchangeName: ExchangeName;
+  },
+  path?: string,
+  columns?: Columns[]
+): Promise<void>
+```
+
+<ParamField body="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+<ParamField body="context" type="object" required>
+  Live context with `strategyName` and `exchangeName`.
+</ParamField>
+
+<ParamField body="path" type="string">
+  Optional directory path. Defaults to `"./dump/live"`.
+</ParamField>
+
+<ParamField body="columns" type="Columns[]">
+  Optional column selection for the saved report.
+</ParamField>
+
+### Example
+
+```typescript
+// Save to default path: ./dump/live/my-strategy.md
+await Live.dump("BTCUSDT", {
+  strategyName: "my-strategy",
+  exchangeName: "binance",
+});
+
+// Save to a custom directory
+await Live.dump(
+  "BTCUSDT",
+  { strategyName: "my-strategy", exchangeName: "binance" },
+  "./reports/live"
+);
+```
+
+---
+
+## `Live.clear()`
+
+Clears accumulated live session data for the given symbol-strategy pair.
+
+```typescript
+Live.clear(
+  symbol: string,
+  context: {
+    strategyName: StrategyName;
+    exchangeName: ExchangeName;
+  }
+): void
+```
+
+<ParamField body="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+<ParamField body="context" type="object" required>
+  Live context with `strategyName` and `exchangeName`.
+</ParamField>
+
+---
+
+## `IStrategyTickResult` shape
+
+Live results are a discriminated union. Use `result.action` as a type guard.
+
+| `action` value | When emitted | Key extra fields |
+|---|---|---|
+| `"opened"` | New position created | `signal`, `currentPrice` |
+| `"closed"` | Position exited | `signal`, `pnl`, `closeReason`, `closeTimestamp` |
+| `"active"` | Position being monitored (not yielded by default) | `signal`, `pnl`, `percentTp`, `percentSl` |
+| `"idle"` | No active position (not yielded by default) | `currentPrice` |
+| `"scheduled"` | Entry order placed, waiting for price | `signal` |
+| `"cancelled"` | Scheduled order cancelled | `signal`, `reason` |
+
+All results include `strategyName`, `exchangeName`, `symbol`, `backtest: false`, and `createdAt`.

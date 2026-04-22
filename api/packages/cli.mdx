@@ -1,0 +1,277 @@
+---
+title: "@backtest-kit/cli: zero-boilerplate strategy runner"
+description: "Run backtests, paper trading, and live bots from a single npm script. The CLI handles candle caching, dashboard, and Telegram notifications automatically."
+---
+
+`@backtest-kit/cli` is the fastest way to run a `backtest-kit` strategy. You point the CLI at your strategy entry point — a file that calls `addStrategySchema`, `addExchangeSchema`, and `addFrameSchema` — and the CLI handles everything else: candle cache warming, web dashboard, Telegram notifications, graceful shutdown, and broker adapter loading. No bootstrap code lives in your project.
+
+## Installation
+
+```bash
+npm install @backtest-kit/cli backtest-kit
+```
+
+The CLI has several optional peer dependencies. Install only what you need:
+
+```bash
+# Full feature set
+npm install @backtest-kit/cli backtest-kit \
+  @backtest-kit/graph @backtest-kit/ollama @backtest-kit/pinets \
+  @backtest-kit/signals @backtest-kit/ui \
+  typescript
+```
+
+## Setting up a project
+
+<Steps>
+  <Step title="Scaffold a new project">
+    Run `--init` to generate a ready-to-use project directory with example strategy files, Pine Script indicators, and auto-fetched library documentation:
+
+    ```bash
+    npx @backtest-kit/cli --init --output my-trading-bot
+    cd my-trading-bot
+    npm install
+    ```
+
+    The generated layout looks like this:
+
+    ```
+    my-trading-bot/
+    ├── package.json
+    ├── CLAUDE.md
+    ├── content/
+    │   └── feb_2026.strategy.ts   # example strategy entry point
+    ├── docs/lib/                  # fetched library READMEs
+    ├── math/
+    │   └── feb_2026.pine          # example Pine Script indicator
+    └── modules/
+        ├── dump.module.ts
+        └── pine.module.ts
+    ```
+  </Step>
+
+  <Step title="Write your strategy entry point">
+    Your entry point registers schemas using `backtest-kit`. The CLI is only the runner — keep all strategy logic here:
+
+    ```typescript
+    // content/my-strategy.ts
+    import { addExchangeSchema, addFrameSchema, addStrategySchema } from 'backtest-kit';
+    import ccxt from 'ccxt';
+
+    addExchangeSchema({
+      exchangeName: 'binance',
+      getCandles: async (symbol, interval, since, limit) => {
+        const exchange = new ccxt.binance();
+        const ohlcv = await exchange.fetchOHLCV(symbol, interval, since.getTime(), limit);
+        return ohlcv.map(([timestamp, open, high, low, close, volume]) => ({
+          timestamp, open, high, low, close, volume,
+        }));
+      },
+      formatPrice: (symbol, price) => price.toFixed(2),
+      formatQuantity: (symbol, quantity) => quantity.toFixed(8),
+    });
+
+    addFrameSchema({
+      frameName: 'feb-2024',
+      interval: '1m',
+      startDate: new Date('2024-02-01'),
+      endDate: new Date('2024-02-29'),
+    });
+
+    addStrategySchema({
+      strategyName: 'my-strategy',
+      interval: '15m',
+      getSignal: async (symbol) => {
+        // return ISignalDto or null
+        return null;
+      },
+    });
+    ```
+  </Step>
+
+  <Step title="Wire up npm scripts">
+    Add CLI commands to `package.json`. Each script targets the same entry point file:
+
+    ```json
+    {
+      "scripts": {
+        "backtest": "npx @backtest-kit/cli --backtest ./content/my-strategy.ts",
+        "paper":    "npx @backtest-kit/cli --paper    ./content/my-strategy.ts",
+        "start":    "npx @backtest-kit/cli --live     ./content/my-strategy.ts"
+      }
+    }
+    ```
+  </Step>
+
+  <Step title="Run a backtest">
+    Pass `--symbol` to choose the trading pair. Add `--ui` for the web dashboard and `--telegram` for trade notifications:
+
+    ```bash
+    npm run backtest -- --symbol BTCUSDT --ui --telegram
+    ```
+
+    Before the backtest starts, the CLI warms the candle cache for every interval in `--cacheInterval` (default: `1m, 15m, 30m, 4h`). Subsequent runs use the cache — no API calls. Pass `--noCache` to skip warming.
+  </Step>
+</Steps>
+
+## Execution modes
+
+The CLI supports four execution modes selected by a boolean flag:
+
+| Flag | Mode | Description |
+|------|------|-------------|
+| `--backtest` | Historical backtest | Runs against cached candle data using a registered `FrameSchema` |
+| `--walker` | A/B comparison | Runs multiple strategy files against the same period and ranks them |
+| `--paper` | Paper trading | Live prices, no real orders — identical code path to live |
+| `--live` | Live trading | Real trades via exchange API; requires API keys in `.env` |
+
+### Walker — compare strategy variants
+
+Pass multiple entry points to rank strategies against the same period:
+
+```bash
+npx @backtest-kit/cli --walker \
+  --symbol BTCUSDT \
+  --noCache \
+  --markdown \
+  --output feb_2026_comparison \
+  ./content/v1.strategy.ts \
+  ./content/v2.strategy.ts \
+  ./content/v3.strategy.ts
+# → ./dump/feb_2026_comparison.md
+```
+
+## CLI flags reference
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--backtest` | boolean | `false` | Run historical backtest |
+| `--walker` | boolean | `false` | Run A/B strategy comparison |
+| `--paper` | boolean | `false` | Paper trading |
+| `--live` | boolean | `false` | Live trading |
+| `--ui` | boolean | `false` | Start web dashboard at `http://localhost:60050` |
+| `--telegram` | boolean | `false` | Send trade notifications via Telegram |
+| `--verbose` | boolean | `false` | Log each candle fetch |
+| `--noCache` | boolean | `false` | Skip candle cache warming |
+| `--noFlush` | boolean | `false` | Keep existing report/log folders |
+| `--symbol` | string | `"BTCUSDT"` | Trading pair |
+| `--strategy` | string | first registered | Strategy name |
+| `--exchange` | string | first registered | Exchange name |
+| `--frame` | string | first registered | Backtest frame name |
+| `--cacheInterval` | string | `"1m, 15m, 30m, 4h"` | Intervals to pre-cache |
+
+## PineScript indicators (`--pine`)
+
+Run a local `.pine` file against a real exchange and print results as a Markdown table — no TradingView account required.
+
+```bash
+npx @backtest-kit/cli --pine ./math/my_indicator.pine \
+  --symbol BTCUSDT \
+  --timeframe 15m \
+  --limit 180
+```
+
+The CLI reads all `plot()` calls with `display=display.data_window` as output columns:
+
+```pine
+//@version=5
+indicator("MyIndicator", overlay=true)
+
+// ... computation ...
+
+plot(close,    "Close",    display=display.data_window)
+plot(position, "Position", display=display.data_window)
+```
+
+Save results to a file with `--json`, `--jsonl`, or `--markdown`:
+
+```bash
+npx @backtest-kit/cli --pine ./math/my_indicator.pine \
+  --symbol BTCUSDT --timeframe 15m --limit 180 --markdown
+# → ./math/dump/my_indicator.md
+```
+
+| Pine flag | Type | Description |
+|-----------|------|-------------|
+| `--pine` | boolean | Enable PineScript execution mode |
+| `--timeframe` | string | Candle interval (default: `"15m"`) |
+| `--limit` | string | Number of candles to fetch (default: `250`) |
+| `--when` | string | End date — ISO 8601 or Unix ms (default: now) |
+| `--output` | string | Output file base name |
+| `--json` | boolean | Write plots as JSON |
+| `--jsonl` | boolean | Write plots as JSONL |
+| `--markdown` | boolean | Write Markdown table |
+
+## Telegram notifications
+
+Add `--telegram` to any mode to send formatted HTML messages with 1m / 15m / 1h price charts for every position event: opened, closed, scheduled, cancelled, risk rejection, partial profit/loss, trailing stop, and breakeven.
+
+Set these environment variables in your `.env`:
+
+```env
+CC_TELEGRAM_TOKEN=your_bot_token_here
+CC_TELEGRAM_CHANNEL=-100123456789
+```
+
+## Broker adapter (module hooks)
+
+Drop a mode-specific module file to wire your exchange SDK to backtest-kit without touching CLI internals. The CLI loads it automatically before starting:
+
+| Mode flag | Module file loaded |
+|-----------|--------------------|
+| `--live` | `./modules/live.module.mjs` |
+| `--paper` | `./modules/paper.module.mjs` |
+| `--backtest` | `./modules/backtest.module.mjs` |
+| `--walker` | `./modules/walker.module.mjs` |
+
+```typescript
+// modules/live.module.ts
+import { Broker, IBroker, BrokerSignalOpenPayload, BrokerSignalClosePayload } from 'backtest-kit';
+
+class MyBroker implements Partial<IBroker> {
+  async onSignalOpenCommit(payload: BrokerSignalOpenPayload) {
+    // place open order on exchange
+  }
+
+  async onSignalCloseCommit(payload: BrokerSignalClosePayload) {
+    // place close order on exchange
+  }
+}
+
+Broker.useBrokerAdapter(MyBroker);
+Broker.enable();
+```
+
+Every commit method fires **before** internal position state changes. If the exchange throws, the mutation is rolled back and backtest-kit retries on the next tick. In backtest mode, all broker calls are automatically skipped.
+
+## Programmatic API
+
+Call `run()` from your own script to avoid spawning a child process:
+
+```typescript
+import { run } from '@backtest-kit/cli';
+
+await run('backtest', {
+  entryPoint: './content/my-strategy.ts',
+  symbol: 'BTCUSDT',
+  frame: 'feb-2024',
+  cacheInterval: ['1m', '15m', '1h'],
+  verbose: true,
+});
+```
+
+`run()` accepts `"backtest"`, `"paper"`, or `"live"` as the first argument. It can only be called once per process.
+
+## Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CC_TELEGRAM_TOKEN` | — | Telegram bot token (from @BotFather) |
+| `CC_TELEGRAM_CHANNEL` | — | Telegram channel or chat ID |
+| `CC_WWWROOT_HOST` | `0.0.0.0` | UI server bind address |
+| `CC_WWWROOT_PORT` | `60050` | UI server port |
+| `CC_QUICKCHART_HOST` | — | Self-hosted QuickChart instance URL |
+
+<Note>
+When no exchange, frame, or strategy is registered, the CLI falls back to CCXT Binance, a February 2024 frame, and `BTCUSDT` respectively, and prints a console warning for each. The default exchange does not support order book fetching in backtest mode — register a custom exchange schema if your strategy calls `getOrderBook()`.
+</Note>

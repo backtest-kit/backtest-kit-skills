@@ -1,0 +1,220 @@
+---
+title: "Scaffold a full Backtest Kit trading bot in seconds"
+description: "Generate a ready-to-run Backtest Kit project in seconds using @backtest-kit/cli --init or @backtest-kit/sidekick — no manual wiring required."
+---
+
+Instead of wiring up exchange schemas, frame definitions, logging, and a runner script by hand, you can scaffold a working project with a single `npx` command. Backtest Kit provides two scaffold tools with different trade-offs: `@backtest-kit/cli --init` keeps all boilerplate inside the package so your project contains only strategy files, while `@backtest-kit/sidekick` copies the full wiring into your project so you can read and modify every part of the setup.
+
+<Tabs>
+  <Tab title="@backtest-kit/cli">
+
+    ## CLI init scaffold
+
+    `@backtest-kit/cli --init` generates a minimal project directory. The exchange registration, candle cache warming, dashboard startup, and Telegram notifications all live inside `@backtest-kit/cli` and are invoked via `npm start`. Your project contains only strategy-specific files.
+
+    ### Create the project
+
+    ```bash
+    npx @backtest-kit/cli --init --output backtest-kit-project
+    cd backtest-kit-project
+    npm install
+    npm start
+    ```
+
+    Replace `backtest-kit-project` with any directory name you prefer. The target directory must not already exist.
+
+    ### What gets generated
+
+    ```
+    backtest-kit-project/
+    ├── package.json              # pre-configured scripts and dependencies
+    ├── .gitignore
+    ├── CLAUDE.md                 # AI-agent guide for writing strategies
+    ├── content/
+    │   └── feb_2026.strategy.ts  # example strategy entry point
+    ├── docs/
+    │   ├── lib/                  # library READMEs, fetched automatically
+    │   ├── backtest_actions.md
+    │   ├── backtest_strategy_structure.md
+    │   └── ...
+    ├── math/
+    │   └── feb_2026.pine         # example Pine Script indicator
+    ├── modules/
+    │   ├── dump.module.ts        # exchange schema for --dump mode
+    │   └── pine.module.ts        # exchange schema for --pine mode
+    ├── report/
+    │   └── feb_2026.md           # example strategy research report
+    └── scripts/
+        └── fetch_docs.mjs        # downloads library READMEs into docs/lib/
+    ```
+
+    After scaffolding, `@backtest-kit/cli` automatically runs `scripts/fetch_docs.mjs` to download the latest README files for all bundled libraries into `docs/lib/`. Run it again at any time to refresh:
+
+    ```bash
+    npm run sync:lib
+    ```
+
+    ### Run modes
+
+    The generated `package.json` includes scripts for every execution mode:
+
+    ```bash
+    # Run a backtest on historical data
+    npm run backtest -- --symbol BTCUSDT
+
+    # Paper trade on live prices (no real orders)
+    npm run paper -- --symbol BTCUSDT
+
+    # Deploy a live trading bot
+    npm start -- --symbol BTCUSDT
+    ```
+
+    Pass `--ui` to start the web dashboard at `http://localhost:60050`, and `--telegram` to enable trade notifications.
+
+    <Tip>
+      You can point `@backtest-kit/cli` at any strategy file without scaffolding. If you have an existing `backtest-kit` strategy, run `npx @backtest-kit/cli --backtest ./src/index.mjs` directly.
+    </Tip>
+
+    ### How the CLI runner works
+
+    When you run `npm run backtest`, `@backtest-kit/cli` does the following automatically:
+
+    1. Changes the working directory to the strategy file's location
+    2. Loads `.env` from the project root, then the strategy directory (overrides root)
+    3. Removes old report, log, markdown, and agent output from `dump/`
+    4. Warms the candle cache for the configured intervals
+    5. Loads any mode-specific broker adapter module (e.g. `modules/live.module.ts`)
+    6. Starts the backtest or live run
+
+    All of this happens without any code in your project files.
+
+  </Tab>
+  <Tab title="@backtest-kit/sidekick">
+
+    ## Sidekick scaffold
+
+    `@backtest-kit/sidekick` generates a project where every part of the setup lives as editable source files inside your project — exchange adapter, frame definitions, risk rules, strategy logic, action handlers, and the runner script. Use it when you need full visibility and control over the wiring.
+
+    ### Create the project
+
+    ```bash
+    npx -y @backtest-kit/sidekick my-trading-bot
+    cd my-trading-bot
+    npm start
+    ```
+
+    Replace `my-trading-bot` with your preferred project name. Pass `.` to scaffold into the current directory (it must be empty).
+
+    ### What gets generated
+
+    ```
+    my-trading-bot/
+    ├── src/
+    │   ├── index.mjs                         # entry point
+    │   ├── main/bootstrap.mjs                # mode dispatcher (backtest / paper / live)
+    │   ├── config/
+    │   │   ├── setup.mjs                     # logger, storage, notifications, UI server
+    │   │   ├── validate.mjs                  # schema validation for all enums
+    │   │   ├── params.mjs                    # environment variables
+    │   │   └── ccxt.mjs                      # Binance exchange singleton via CCXT
+    │   ├── logic/
+    │   │   ├── strategy/main.strategy.mjs    # multi-timeframe signal logic
+    │   │   ├── exchange/binance.exchange.mjs # exchange schema
+    │   │   ├── frame/*.frame.mjs             # backtest time frames
+    │   │   ├── risk/sl_distance.risk.mjs     # SL distance validation
+    │   │   ├── risk/tp_distance.risk.mjs     # TP distance validation
+    │   │   └── action/
+    │   │       ├── backtest_partial_profit_taking.action.mjs
+    │   │       ├── backtest_lower_stop_on_breakeven.action.mjs
+    │   │       └── backtest_position_monitor.action.mjs
+    │   ├── classes/
+    │   │   ├── BacktestPartialProfitTakingAction.mjs
+    │   │   ├── BacktestLowerStopOnBreakevenAction.mjs
+    │   │   └── BacktestPositionMonitorAction.mjs
+    │   ├── math/
+    │   │   ├── timeframe_4h.math.mjs         # 4H trend data
+    │   │   └── timeframe_15m.math.mjs        # 15m signal data
+    │   └── enum/                             # string constants for schema references
+    ├── config/source/
+    │   ├── timeframe_4h.pine    # Pine Script v5 — 4H daily trend filter
+    │   └── timeframe_15m.pine   # Pine Script v5 — 15m entry signal generator
+    ├── scripts/
+    │   └── cache/
+    │       ├── cache_candles.mjs     # pre-download OHLCV candles
+    │       ├── validate_candles.mjs  # verify cached candle integrity
+    │       └── cache_model.mjs       # pull Ollama LLM model
+    ├── CLAUDE.md                 # AI strategy development guide
+    ├── .env                      # environment variables
+    └── package.json
+    ```
+
+    ### What the generated strategy does
+
+    The scaffolded project includes a working multi-timeframe strategy:
+
+    - **4H trend filter** — determines market regime using ADX, MACD, and RSI. Only allows long signals in bull regimes and short signals in bear regimes.
+    - **15m signal generator** — produces entry signals from EMA crossover, volume spike, and momentum, with static 2%/3% SL/TP.
+    - **Risk validation** — rejects signals where SL or TP is less than 0.2% from entry (slippage protection).
+    - **Partial profit taking** — scales out at three levels: 33% at TP3, 33% at TP2, 34% at TP1.
+    - **Breakeven trailing stop** — moves the stop-loss to breakeven when the price reaches a profit threshold.
+
+    The strategy uses Pine Script v5 indicators executed locally via `@backtest-kit/pinets` — no TradingView account required.
+
+    ### Predefined backtest frames
+
+    | Frame | Period | Market character |
+    |-------|--------|-----------------|
+    | `February2024` | Feb 1–29, 2024 | Bull run |
+    | `October2025` | Oct 1–31, 2025 | Sharp drop Oct 9–11 |
+    | `November2025` | Nov 1–30, 2025 | Sideways with downtrend |
+    | `December2025` | Dec 1–31, 2025 | Sideways, no clear direction |
+
+    <Tip>
+      Each frame file lives in `src/logic/frame/` as a plain `.mjs` file. Copy an existing frame, adjust the dates, and register it with `addFrameSchema` to add your own backtest period.
+    </Tip>
+
+  </Tab>
+</Tabs>
+
+## Choosing between CLI init and Sidekick
+
+| | `@backtest-kit/cli --init` | `@backtest-kit/sidekick` |
+|---|---|---|
+| **Boilerplate location** | Inside `@backtest-kit/cli` package | In your project files |
+| **Your project contains** | Strategy files only | Full wiring — exchange, frame, risk, actions, runner |
+| **Customise infrastructure** | Via CLI flags and module hooks | Edit files directly |
+| **Upgrade path** | Update `@backtest-kit/cli` | Update manually |
+| **Best for** | Quick setup, minimal project size | Full control, custom infrastructure |
+
+<Note>
+  Both tools generate a `CLAUDE.md` file that helps AI coding assistants understand the project structure and write strategy code in the correct style.
+</Note>
+
+## Environment variables
+
+Both scaffolded projects read from a `.env` file. Common variables:
+
+```env
+# Telegram notifications (required for --telegram flag)
+CC_TELEGRAM_TOKEN=your_bot_token_here
+CC_TELEGRAM_CHANNEL=-100123456789
+
+# Web dashboard server (optional — defaults shown)
+CC_WWWROOT_HOST=0.0.0.0
+CC_WWWROOT_PORT=60050
+
+# Live exchange API keys
+BINANCE_API_KEY=your_api_key
+BINANCE_API_SECRET=your_api_secret
+```
+
+## What to do next
+
+<CardGroup cols={2}>
+  <Card title="Run your first backtest" icon="rocket" href="/quickstart">
+    Understand each schema type and how they wire together before modifying your scaffolded project.
+  </Card>
+  <Card title="Live trading" icon="chart-line" href="/guides/live-trading">
+    Connect a broker adapter and deploy your strategy to a live exchange.
+  </Card>
+</CardGroup>

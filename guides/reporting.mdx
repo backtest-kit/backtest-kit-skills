@@ -1,0 +1,188 @@
+---
+title: "Generate Backtest Kit trading reports and perf metrics"
+description: "Use Backtest.dump, Live.dump, and Performance.dump to produce Markdown reports with PNL, Sharpe Ratio, win rate, and execution bottleneck analysis."
+---
+
+Backtest Kit generates Markdown reports automatically by accumulating signal events as the engine runs. You call a single `dump` method to flush the current data to disk, or `getData` to retrieve it programmatically. The `Performance` class adds a second layer of profiling that shows where time is spent in each backtest or live tick.
+
+## Backtest reports
+
+### Generate a report after a backtest
+
+Call `Backtest.dump` inside `listenDoneBacktest` to write the report as soon as the backtest finishes. The report is written to `./logs/backtest/` by default.
+
+```typescript
+import {
+  Backtest,
+  listenDoneBacktest,
+} from 'backtest-kit';
+
+Backtest.background('BTCUSDT', {
+  strategyName: 'my-strategy',
+  exchangeName: 'binance',
+  frameName: '1d-test',
+});
+
+listenDoneBacktest(async (event) => {
+  await Backtest.dump(event.symbol, {
+    strategyName: event.strategyName,
+    exchangeName: event.exchangeName,
+    frameName: event.frameName,
+  });
+});
+```
+
+To write to a custom path, pass it as the third argument:
+
+```typescript
+await Backtest.dump('BTCUSDT', {
+  strategyName: 'my-strategy',
+  exchangeName: 'binance',
+  frameName: '1d-test',
+}, './reports/backtest');
+```
+
+### Access statistics programmatically
+
+`Backtest.getData` returns the accumulated statistics without writing a file:
+
+```typescript
+const stats = await Backtest.getData('my-strategy');
+
+console.log('Total signals:', stats.totalEvents);
+console.log('Win rate:',      stats.winRate);
+console.log('Average PNL:',   stats.avgPnl);
+console.log('Sharpe Ratio:',  stats.sharpeRatio);
+console.log('Max drawdown:',  stats.maxDrawdown);
+```
+
+### Get the raw Markdown string
+
+Use `Backtest.getReport` to retrieve the rendered Markdown without writing it to disk — useful for sending to a webhook, logging system, or notification service:
+
+```typescript
+const markdown = await Backtest.getReport('my-strategy');
+// send to Slack, Telegram, etc.
+```
+
+## Live reports
+
+Live reports accumulate across the entire runtime of the bot. Call `Live.dump` after each closed signal so the report reflects the latest trades.
+
+```typescript
+import { Live, listenSignalLive } from 'backtest-kit';
+
+listenSignalLive(async (event) => {
+  if (event.action === 'closed') {
+    await Live.dump(event.symbol, {
+      strategyName: event.strategyName,
+      exchangeName: event.exchangeName,
+    });
+  }
+});
+```
+
+`Live.getData` and `Live.getReport` work identically to their `Backtest` counterparts.
+
+## Performance profiling
+
+The `Performance` class captures execution timing for every phase of the engine: `backtest_total`, `backtest_timeframe`, `backtest_signal`, and `live_tick`. Use it to find bottlenecks — for example, a slow `getSignal` function caused by a high-latency LLM call.
+
+```typescript
+import { Performance, listenDoneBacktest } from 'backtest-kit';
+
+listenDoneBacktest(async (event) => {
+  // Write performance report to ./logs/performance/
+  await Performance.dump(event.strategyName);
+});
+```
+
+To read the data without writing a file:
+
+```typescript
+const perf = await Performance.getData('my-strategy');
+
+console.log('Total events:',    perf.totalEvents);
+console.log('Total duration:',  perf.totalDuration + 'ms');
+
+for (const [metricType, stats] of Object.entries(perf.metricStats)) {
+  console.log(`${metricType}:`);
+  console.log('  avg:', stats.avg.toFixed(2) + 'ms');
+  console.log('  p95:', stats.p95.toFixed(2) + 'ms');
+  console.log('  p99:', stats.p99.toFixed(2) + 'ms');
+}
+```
+
+The performance report includes these metrics per strategy:
+
+| Metric | Description |
+|---|---|
+| `backtest_total` | Full backtest wall-clock duration |
+| `backtest_timeframe` | Time spent per timeframe iteration |
+| `backtest_signal` | Time from tick to signal close (includes LLM calls) |
+| `live_tick` | Time per live tick iteration |
+
+Each metric includes `count`, `avg`, `min`, `max`, `stdDev`, `median`, `P95`, and `P99`.
+
+## What the reports include
+
+Every Backtest and Live report includes a Markdown table with one row per signal:
+
+- Symbol and strategy name
+- Position direction (`long` / `short`)
+- Entry, TP, and SL prices
+- Close reason (`take_profit`, `stop_loss`, `time_expired`, `closed`)
+- PNL percentage and absolute USD value
+- Entry cost and total invested
+
+Aggregate statistics at the top of each report:
+
+- **Win rate** — percentage of signals closed at TP
+- **Average PNL** — mean return across all closed signals
+- **Sharpe Ratio** — risk-adjusted return (higher is better)
+- **Max drawdown** — largest peak-to-trough loss
+
+## Customize report columns
+
+Use `setColumns` to add, remove, or reorder columns in any report type:
+
+```typescript
+import { setColumns } from 'backtest-kit';
+
+setColumns({
+  backtest_columns: [
+    {
+      key: 'signalId',
+      label: 'ID',
+      format: (data) => data.signal.id.slice(0, 8),
+      isVisible: () => true,
+    },
+    {
+      key: 'pnl',
+      label: 'PNL %',
+      format: (data) => data.pnl.pnlPercentage.toFixed(2) + '%',
+      isVisible: () => true,
+    },
+  ],
+});
+```
+
+<Note>
+`setColumns` validates the column configuration before applying it. If a column definition is invalid, the previous configuration is restored and an error is thrown.
+</Note>
+
+## Clear accumulated data
+
+Call `clear` between sequential backtests on the same strategy name to avoid mixing results:
+
+```typescript
+await Backtest.clear('my-strategy');
+await Performance.clear('my-strategy');
+```
+
+Pass no argument to clear all strategies at once:
+
+```typescript
+await Backtest.clear();
+await Performance.clear();
+```

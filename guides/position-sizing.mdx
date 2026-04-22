@@ -1,0 +1,204 @@
+---
+title: "Configure position sizing for your trading strategy"
+description: "Register fixed percentage, Kelly Criterion, or ATR-based sizing schemas and use PositionSize to calculate position cost before returning a signal."
+---
+
+Position sizing controls how much capital is allocated to each trade. Backtest Kit ships three built-in models — Fixed Percentage, Kelly Criterion, and ATR-based — each registered with `addSizingSchema` and called via `PositionSize`. By default every position entry costs $100 (`CC_POSITION_ENTRY_COST`). You override this by passing a calculated `cost` field back from `getSignal`.
+
+## Default entry cost
+
+The global default is defined by `CC_POSITION_ENTRY_COST` (default: `100`). Every DCA entry is sized as one unit of this cost. To change it globally:
+
+```typescript
+import { setConfig } from 'backtest-kit';
+
+setConfig({
+  CC_POSITION_ENTRY_COST: 200, // each entry costs $200
+});
+```
+
+To set entry cost per-signal, return a `cost` field in the signal DTO:
+
+```typescript
+return {
+  position: 'long',
+  priceTakeProfit: tp,
+  priceStopLoss: sl,
+  cost: calculatedCost, // overrides CC_POSITION_ENTRY_COST for this signal
+};
+```
+
+## Register a sizing schema
+
+<Tabs>
+
+<Tab title="Fixed percentage">
+
+Risks a fixed percentage of your account balance per trade, sized relative to the distance between entry and stop-loss.
+
+```typescript
+import { addSizingSchema } from 'backtest-kit';
+
+addSizingSchema({
+  sizingName: 'conservative',
+  method: 'fixed-percentage',
+  riskPercentage: 1,           // risk 1% of account per trade
+  maxPositionPercentage: 5,    // never allocate more than 5% of account
+  minPositionSize: 10,         // floor in USD
+  maxPositionSize: 500,        // ceiling in USD
+});
+```
+
+Use inside `getSignal`:
+
+```typescript
+import { PositionSize } from 'backtest-kit';
+
+const cost = await PositionSize.fixedPercentage(
+  symbol,
+  accountBalance,  // current account balance in USD
+  priceOpen,
+  priceStopLoss,
+  { sizingName: 'conservative' }
+);
+
+return { position: 'long', priceTakeProfit: tp, priceStopLoss: sl, cost };
+```
+
+</Tab>
+
+<Tab title="Kelly Criterion">
+
+Applies the Kelly formula to maximize long-run growth given your historical win rate and win/loss ratio. The `kellyMultiplier` scales the raw Kelly fraction — `0.25` (quarter Kelly) is a conservative default that reduces variance.
+
+```typescript
+import { addSizingSchema } from 'backtest-kit';
+
+addSizingSchema({
+  sizingName: 'kelly',
+  method: 'kelly-criterion',
+  kellyMultiplier: 0.25,       // quarter Kelly — reduces variance
+  maxPositionPercentage: 10,
+  maxPositionSize: 1000,
+});
+```
+
+Use inside `getSignal`:
+
+```typescript
+import { PositionSize } from 'backtest-kit';
+
+const cost = await PositionSize.kellyCriterion(
+  symbol,
+  accountBalance,
+  priceOpen,
+  winRate,       // historical win rate, e.g. 0.55 for 55%
+  winLossRatio,  // average win / average loss, e.g. 1.5
+  { sizingName: 'kelly' }
+);
+
+return { position: 'long', priceTakeProfit: tp, priceStopLoss: sl, cost };
+```
+
+<Note>
+Kelly Criterion can produce very large position sizes when win rate and win/loss ratio are high. Always set `maxPositionPercentage` or `maxPositionSize` as a safety cap.
+</Note>
+
+</Tab>
+
+<Tab title="ATR-based">
+
+Sizes positions relative to current volatility. A higher ATR means wider stops and a smaller position; a lower ATR means tighter stops and a larger position. The `atrMultiplier` scales the stop distance used in the calculation.
+
+```typescript
+import { addSizingSchema } from 'backtest-kit';
+
+addSizingSchema({
+  sizingName: 'atr-dynamic',
+  method: 'atr-based',
+  riskPercentage: 2,     // risk 2% of account per trade
+  atrMultiplier: 2,      // stop distance = ATR × 2
+  maxPositionSize: 800,
+});
+```
+
+Use inside `getSignal`:
+
+```typescript
+import { PositionSize, getCandles } from 'backtest-kit';
+
+// Calculate ATR from recent candles
+const candles = await getCandles(symbol, '1h', 14);
+const atr = calculateATR(candles); // your indicator function
+
+const cost = await PositionSize.atrBased(
+  symbol,
+  accountBalance,
+  priceOpen,
+  atr,
+  { sizingName: 'atr-dynamic' }
+);
+
+return { position: 'long', priceTakeProfit: tp, priceStopLoss: sl, cost };
+```
+
+</Tab>
+
+</Tabs>
+
+## Full example: sizing inside a strategy
+
+```typescript
+import { addStrategySchema, addSizingSchema, PositionSize, getCandles } from 'backtest-kit';
+
+addSizingSchema({
+  sizingName: 'conservative',
+  method: 'fixed-percentage',
+  riskPercentage: 1,
+  maxPositionSize: 500,
+});
+
+addStrategySchema({
+  strategyName: 'sized-strategy',
+  interval: '5m',
+  getSignal: async (symbol, when, currentPrice) => {
+    const tp = currentPrice * 1.03;
+    const sl = currentPrice * 0.985;
+
+    // Use a real account balance from your exchange or a fixed value for backtesting
+    const accountBalance = 10_000;
+
+    const cost = await PositionSize.fixedPercentage(
+      symbol,
+      accountBalance,
+      currentPrice,
+      sl,
+      { sizingName: 'conservative' }
+    );
+
+    return {
+      position: 'long',
+      priceTakeProfit: tp,
+      priceStopLoss: sl,
+      cost,
+    };
+  },
+});
+```
+
+## Observe calculated sizes
+
+Use the `callbacks.onCalculate` hook in the sizing schema to log or audit every calculated size:
+
+```typescript
+addSizingSchema({
+  sizingName: 'conservative',
+  method: 'fixed-percentage',
+  riskPercentage: 1,
+  callbacks: {
+    onCalculate: (quantity, params) => {
+      console.log(`Sized ${params.symbol}: $${quantity.toFixed(2)}`);
+    },
+  },
+});
+```

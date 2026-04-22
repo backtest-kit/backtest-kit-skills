@@ -1,0 +1,212 @@
+---
+title: "Signal lifecycle: idle, opened, active, and closed"
+description: "Every trade in Backtest Kit moves through four states: idle, opened, active, and closed. Learn each state to write callbacks and interpret reports correctly."
+---
+
+Every symbol your strategy monitors is always in one of four states. The framework tracks this state internally, persists it to disk in live mode for crash recovery, and surfaces it to you through typed discriminated unions. Understanding the state machine helps you write callbacks, process events, and interpret reports correctly.
+
+## The four states
+
+<Steps>
+  <Step title="idle">
+    No active position exists. On each tick, the framework calls your `getSignal` function (respecting the `interval` throttle). If `getSignal` returns `null`, the strategy stays idle and the tick result has `action: "idle"`.
+
+    ```typescript
+    // Tick result shape in idle state
+    {
+      action: "idle",
+      signal: null,
+      currentPrice: 43250.00,
+      strategyName: "my-strategy",
+      exchangeName: "binance",
+      symbol: "BTCUSDT",
+      backtest: false,
+      createdAt: 1748908800000,
+    }
+    ```
+  </Step>
+
+  <Step title="opened">
+    Your `getSignal` function returned a signal and it passed all validation and risk checks. The position is now open and the framework emits a tick result with `action: "opened"`. This is the moment to log entries, notify external systems, or initialize any per-signal state.
+
+    The signal is persisted to disk immediately so that a crash during the `opened` state does not lose the position.
+
+    ```typescript
+    // Tick result shape when a signal opens
+    {
+      action: "opened",
+      signal: {
+        id: "3f4a...",
+        position: "long",
+        priceTakeProfit: 44500,
+        priceStopLoss: 42000,
+        priceOpen: 43250,
+        minuteEstimatedTime: 240,
+        /* ... */
+      },
+      currentPrice: 43250.00,
+      strategyName: "my-strategy",
+      /* ... */
+    }
+    ```
+  </Step>
+
+  <Step title="active">
+    On every tick after a signal is opened, the framework checks the current VWAP against the TP and SL levels. While neither threshold is hit and the position has not expired, the tick result has `action: "active"`. The `percentTp` and `percentSl` fields tell you how far the price has traveled toward each target.
+
+    ```typescript
+    // Tick result shape while monitoring an active signal
+    {
+      action: "active",
+      signal: { /* IPublicSignalRow */ },
+      currentPrice: 43800,
+      percentTp: 42,  // 42% of the way from entry to take profit
+      percentSl: 0,
+      pnl: { pnlPercentage: 1.27, pnlCost: 1.27, /* ... */ },
+      /* ... */
+    }
+    ```
+
+    <Note>
+      `getSignal` is not called while a position is active. The strategy waits for the current position to close before looking for a new signal.
+    </Note>
+  </Step>
+
+  <Step title="closed">
+    The position closes when one of three conditions is met: the price crosses the take profit level, the price crosses the stop loss level, or the position has been open longer than `minuteEstimatedTime`. The tick result has `action: "closed"` and includes the final `pnl` and a `closeReason`.
+
+    ```typescript
+    // Tick result shape when a signal closes
+    {
+      action: "closed",
+      signal: { /* IPublicSignalRow */ },
+      currentPrice: 44500,
+      closeReason: "take_profit",
+      closeTimestamp: 1748923200000,
+      pnl: {
+        pnlPercentage: 2.84,
+        priceOpen: 43293.65,   // entry adjusted for slippage + fees
+        priceClose: 44456.10,  // exit adjusted for slippage + fees
+        pnlCost: 2.84,
+        pnlEntries: 100,
+      },
+      /* ... */
+    }
+    ```
+  </Step>
+</Steps>
+
+## Close reasons
+
+When a signal reaches the `closed` state, the `closeReason` field tells you why:
+
+| Reason | Description |
+|---|---|
+| `take_profit` | VWAP crossed the `priceTakeProfit` level |
+| `stop_loss` | VWAP crossed the `priceStopLoss` level |
+| `time_expired` | Position was open longer than `minuteEstimatedTime` |
+| `closed` | Position was closed explicitly via `commitClosePending()` |
+
+## The `ISignalDto` structure
+
+Your `getSignal` function returns an `ISignalDto`. The required fields are `position`, `priceTakeProfit`, and `priceStopLoss`. Everything else has a default.
+
+```typescript
+export interface ISignalDto {
+  id?: string;                  // auto-generated UUID if omitted
+  position: "long" | "short";  // required: trade direction
+  note?: string;                // optional: human-readable description
+  priceOpen?: number;           // optional: omit to open at current VWAP price
+  priceTakeProfit: number;      // required: exit target (profit side)
+  priceStopLoss: number;        // required: exit target (loss side)
+  minuteEstimatedTime?: number; // optional: default CC_MAX_SIGNAL_LIFETIME_MINUTES (1440)
+  cost?: number;                // optional: USD entry cost, default CC_POSITION_ENTRY_COST (100)
+}
+```
+
+<Note>
+  If you provide `priceOpen`, the signal enters a **scheduled** state and waits for the market price to reach that level before becoming active. Omit `priceOpen` to open immediately at the current VWAP price.
+</Note>
+
+## Listening to lifecycle events
+
+The cleanest way to react to state changes is through the `callbacks` field on your strategy schema:
+
+```typescript
+addStrategySchema({
+  strategyName: 'my-strategy',
+  getSignal: async (symbol) => { /* ... */ },
+  callbacks: {
+    onOpen: (symbol, signal, currentPrice, backtest) => {
+      console.log(`Opened ${signal.position} on ${symbol} at ${currentPrice}`);
+    },
+    onClose: (symbol, signal, priceClose, backtest) => {
+      console.log(`Closed with PnL: ${signal.pnl.pnlPercentage.toFixed(2)}%`);
+    },
+    onActive: (symbol, signal, currentPrice, backtest) => {
+      // called on every monitoring tick
+    },
+  },
+});
+```
+
+You can also subscribe globally using event listeners:
+
+```typescript
+import { listenSignalLive, listenSignalBacktest } from 'backtest-kit';
+
+listenSignalLive((event) => {
+  if (event.action === 'closed') {
+    console.log(event.closeReason, event.pnl.pnlPercentage);
+  }
+});
+```
+
+## Reading the current signal
+
+Inside any strategy callback or during a tick, you can read the current pending signal directly:
+
+```typescript
+import { getPendingSignal } from 'backtest-kit';
+
+const signal = await getPendingSignal(symbol, currentPrice);
+if (signal) {
+  // signal is IPublicSignalRow
+  console.log(signal.priceTakeProfit, signal.priceStopLoss);
+}
+```
+
+`getPendingSignal` returns `null` when the strategy is idle. It returns the full `IPublicSignalRow`, which extends `ISignalDto` with runtime fields like `pnl`, `originalPriceStopLoss`, `totalEntries`, and `partialExecuted`.
+
+<Warning>
+  Signals that fail built-in validation (wrong TP/SL direction, non-positive prices) are silently dropped and never reach the `opened` state. The strategy returns to `idle` on the next tick. Use `listenValidation` to monitor rejected signals.
+</Warning>
+
+<AccordionGroup>
+  <Accordion title="Scheduled signals (delayed entry)">
+    When you return a signal with `priceOpen` set, the framework creates a **scheduled** signal instead of opening immediately. The scheduled signal waits for the market price to reach `priceOpen`.
+
+    The tick result moves through: `scheduled` → `waiting` (on subsequent ticks) → `opened` (when price reaches entry) — or `cancelled` if the price never reaches entry within `CC_SCHEDULE_AWAIT_MINUTES` (default: 120 minutes).
+
+    You can cancel a scheduled signal manually:
+
+    ```typescript
+    import { commitCancelScheduled } from 'backtest-kit';
+
+    await commitCancelScheduled({ id: 'my-cancel', note: 'Conditions changed' });
+    ```
+  </Accordion>
+
+  <Accordion title="Using minuteEstimatedTime = Infinity">
+    Set `minuteEstimatedTime: Infinity` to keep a position open indefinitely — it will only close on TP, SL, or an explicit `commitClosePending()` call. This is useful for long-term positions where you want full manual control over the exit.
+
+    ```typescript
+    return {
+      position: 'long',
+      priceTakeProfit: entryPrice * 1.10,
+      priceStopLoss: entryPrice * 0.95,
+      minuteEstimatedTime: Infinity,
+    };
+    ```
+  </Accordion>
+</AccordionGroup>

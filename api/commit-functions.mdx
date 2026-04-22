@@ -1,0 +1,390 @@
+---
+title: "Commit functions: adjust and close trading positions"
+description: "Close portions of a position, adjust stop-loss and take-profit levels, add DCA entries, and send notifications from event callbacks or strategy logic."
+---
+
+Commit functions mutate the state of an open position. You call them from within event callbacks — such as `listenPartialProfitAvailable`, `listenBreakevenAvailable`, or `listenActivePing` — or from inside `getSignal` itself. Every commit function reads the current execution context automatically, so you never need to pass backtest/live mode or context identifiers manually.
+
+<Warning>
+  Commit functions require both an execution context and a method context. Calling them outside a strategy callback or event listener throws an `Error`. Additionally, position-level commits (`commitPartialProfit`, `commitTrailingStop`, etc.) silently return `false` when no pending signal exists rather than throwing, so always check the return value.
+</Warning>
+
+---
+
+## Partial close
+
+### `commitPartialProfit(symbol, percentToClose)`
+
+Closes a percentage of the active pending position while price is moving toward take profit. Rejected if the current price is not in the profit direction relative to `priceOpen`.
+
+```typescript
+import { commitPartialProfit, listenPartialProfitAvailable } from "backtest-kit";
+
+listenPartialProfitAvailable(async (event) => {
+  if (event.level >= 30) {
+    const ok = await commitPartialProfit(event.symbol, 30);
+    if (ok) console.log("Closed 30% at profit");
+  }
+});
+```
+
+<ParamField path="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+<ParamField path="percentToClose" type="number" required>
+  Percentage of the position to close (0–100). For a LONG, current price must be above `priceOpen`; for a SHORT, below.
+</ParamField>
+
+Returns `Promise<boolean>` — `true` if the partial close executed, `false` if skipped.
+
+---
+
+### `commitPartialLoss(symbol, percentToClose)`
+
+Closes a percentage of the active pending position while price is moving toward stop loss. Rejected if the current price is not in the loss direction.
+
+```typescript
+import { commitPartialLoss, listenPartialLossAvailable } from "backtest-kit";
+
+listenPartialLossAvailable(async (event) => {
+  if (event.level >= 20) {
+    await commitPartialLoss(event.symbol, 20);
+  }
+});
+```
+
+<ParamField path="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+<ParamField path="percentToClose" type="number" required>
+  Percentage of the position to close (0–100). For a LONG, current price must be below `priceOpen`; for a SHORT, above.
+</ParamField>
+
+Returns `Promise<boolean>`.
+
+---
+
+### `commitPartialProfitCost(symbol, dollarAmount)`
+
+Convenience wrapper around `commitPartialProfit`. Accepts a dollar amount instead of a percentage and converts it automatically using the current invested cost.
+
+```typescript
+import { commitPartialProfitCost } from "backtest-kit";
+
+// Close $150 of a $300 position (50%) at profit
+const ok = await commitPartialProfitCost("BTCUSDT", 150);
+```
+
+<ParamField path="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+<ParamField path="dollarAmount" type="number" required>
+  Dollar value of the position to close. The framework converts this to a percentage of the current `getPositionInvestedCost` value.
+</ParamField>
+
+Returns `Promise<boolean>`.
+
+---
+
+### `commitPartialLossCost(symbol, dollarAmount)`
+
+Convenience wrapper around `commitPartialLoss` that accepts a dollar amount.
+
+```typescript
+import { commitPartialLossCost } from "backtest-kit";
+
+// Close $100 of a $300 position (~33%) at loss
+const ok = await commitPartialLossCost("BTCUSDT", 100);
+```
+
+<ParamField path="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+<ParamField path="dollarAmount" type="number" required>
+  Dollar value of the position to close at a loss.
+</ParamField>
+
+Returns `Promise<boolean>`.
+
+---
+
+## DCA entry
+
+### `commitAverageBuy(symbol, cost?)`
+
+Adds a new DCA entry to the active pending position at the current VWAP price. By default the entry is only accepted when the current price is below the previous effective entry price — this prevents averaging up. You can override this threshold via `setConfig`.
+
+```typescript
+import { commitAverageBuy } from "backtest-kit";
+
+const added = await commitAverageBuy("BTCUSDT");
+if (added) {
+  console.log("DCA entry added");
+}
+```
+
+<ParamField path="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+<ParamField path="cost" type="number">
+  Dollar cost for this entry. Defaults to `CC_POSITION_ENTRY_COST` from global config (typically `$100`).
+</ParamField>
+
+Returns `Promise<boolean>` — `true` if the entry was added, `false` if rejected (price above effective entry or no pending signal).
+
+---
+
+## Trailing adjustments
+
+### `commitTrailingStop(symbol, percentShift, currentPrice)`
+
+Adjusts the stop-loss distance by a percentage shift relative to the **original** SL distance, not the current trailing SL. This prevents error accumulation on repeated calls.
+
+Absorption rule: if the new SL is less protective than the current one, the call is silently rejected. For a LONG, only a higher SL value is accepted.
+
+```typescript
+import { commitTrailingStop, getAveragePrice } from "backtest-kit";
+
+// LONG: entry=100, original SL=90 (10% distance)
+// Tighten SL by 5%: new distance = 5%, new SL = 95
+const price = await getAveragePrice("BTCUSDT");
+await commitTrailingStop("BTCUSDT", -5, price);
+```
+
+<ParamField path="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+<ParamField path="percentShift" type="number" required>
+  Percentage adjustment relative to the original SL distance. Negative values tighten (move closer to entry); positive values loosen.
+</ParamField>
+
+<ParamField path="currentPrice" type="number" required>
+  Current market price, used to validate that the new SL does not intrude into the current price.
+</ParamField>
+
+Returns `Promise<boolean>`.
+
+---
+
+### `commitTrailingTake(symbol, percentShift, currentPrice)`
+
+Adjusts the take-profit distance by a percentage shift relative to the **original** TP distance. Absorption rule: only a more conservative (closer to entry) TP value is accepted on subsequent calls.
+
+```typescript
+import { commitTrailingTake, getAveragePrice } from "backtest-kit";
+
+// LONG: entry=100, original TP=110 (10% distance)
+// Bring TP closer by 3%: new distance = 7%, new TP = 107
+const price = await getAveragePrice("BTCUSDT");
+await commitTrailingTake("BTCUSDT", -3, price);
+```
+
+<ParamField path="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+<ParamField path="percentShift" type="number" required>
+  Percentage adjustment relative to the original TP distance. Negative values bring TP closer to entry.
+</ParamField>
+
+<ParamField path="currentPrice" type="number" required>
+  Current market price.
+</ParamField>
+
+Returns `Promise<boolean>`.
+
+---
+
+### `commitTrailingStopCost(symbol, newStopLossPrice)`
+
+Convenience wrapper around `commitTrailingStop`. Accepts an absolute stop-loss price and converts it to a `percentShift` internally. Fetches the current price via `getAveragePrice` automatically.
+
+```typescript
+import { commitTrailingStopCost } from "backtest-kit";
+
+await commitTrailingStopCost("BTCUSDT", 48500);
+```
+
+<ParamField path="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+<ParamField path="newStopLossPrice" type="number" required>
+  Desired absolute stop-loss price.
+</ParamField>
+
+Returns `Promise<boolean>`.
+
+---
+
+### `commitTrailingTakeCost(symbol, newTakeProfitPrice)`
+
+Convenience wrapper around `commitTrailingTake`. Accepts an absolute take-profit price and converts it to a `percentShift` internally.
+
+```typescript
+import { commitTrailingTakeCost } from "backtest-kit";
+
+await commitTrailingTakeCost("BTCUSDT", 52000);
+```
+
+<ParamField path="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+<ParamField path="newTakeProfitPrice" type="number" required>
+  Desired absolute take-profit price.
+</ParamField>
+
+Returns `Promise<boolean>`.
+
+---
+
+## Breakeven
+
+### `commitBreakeven(symbol)`
+
+Moves the stop-loss to the effective entry price (zero-risk position) when price has moved far enough in the profit direction to cover transaction costs. The threshold is `(CC_PERCENT_SLIPPAGE + CC_PERCENT_FEE) × 2`.
+
+```typescript
+import { commitBreakeven, listenBreakevenAvailable } from "backtest-kit";
+
+listenBreakevenAvailable(async (event) => {
+  const moved = await commitBreakeven(event.symbol);
+  if (moved) console.log("Position moved to breakeven");
+});
+```
+
+<ParamField path="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+Returns `Promise<boolean>` — `true` if the stop-loss was moved to breakeven, `false` if the threshold has not been reached or no pending signal exists.
+
+---
+
+## Scheduled signal management
+
+### `commitActivateScheduled(symbol, payload?)`
+
+Activates a scheduled signal immediately without waiting for price to reach `priceOpen`. The activation flag is set on the next tick of the engine.
+
+```typescript
+import { commitActivateScheduled } from "backtest-kit";
+
+await commitActivateScheduled("BTCUSDT", { id: "manual-activate-001" });
+```
+
+<ParamField path="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+<ParamField path="payload" type="Partial<CommitPayload>">
+  Optional object with `id` and `note` fields for audit logging.
+</ParamField>
+
+Returns `Promise<void>`.
+
+---
+
+### `commitCancelScheduled(symbol, payload?)`
+
+Cancels the scheduled signal without stopping the strategy. The strategy continues to run and can generate new signals on subsequent ticks.
+
+```typescript
+import { commitCancelScheduled } from "backtest-kit";
+
+await commitCancelScheduled("BTCUSDT");
+```
+
+<ParamField path="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+<ParamField path="payload" type="Partial<CommitPayload>">
+  Optional audit payload.
+</ParamField>
+
+Returns `Promise<void>`.
+
+---
+
+### `commitClosePending(symbol, payload?)`
+
+Force-closes the active pending signal without stopping the strategy. Useful for time-based exits or external triggers.
+
+```typescript
+import { commitClosePending } from "backtest-kit";
+
+await commitClosePending("BTCUSDT", { id: "time-exit-001" });
+```
+
+<ParamField path="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+<ParamField path="payload" type="Partial<CommitPayload>">
+  Optional audit payload.
+</ParamField>
+
+Returns `Promise<void>`.
+
+---
+
+## Notifications
+
+### `commitSignalNotify(symbol, payload?)`
+
+Broadcasts a user-defined informational note for the currently active pending signal without affecting position state. Use it to annotate mid-position events (e.g. RSI crossover, volume spike) or trigger external alerts. The notification is also emitted as a `listenSignalNotify` event.
+
+```typescript
+import { commitSignalNotify } from "backtest-kit";
+
+// Inside a listenActivePing callback:
+await commitSignalNotify("BTCUSDT", {
+  notificationNote: "RSI crossed 70 — consider closing",
+  notificationId: "msg-123",
+});
+```
+
+<ParamField path="symbol" type="string" required>
+  Trading pair symbol.
+</ParamField>
+
+<ParamField path="payload" type="Partial<SignalNotificationPayload>">
+  Optional fields: `notificationNote` (human-readable message) and `notificationId` (external correlation ID).
+</ParamField>
+
+Returns `Promise<void>`. Throws if no pending signal exists for the given symbol.
+
+---
+
+## Common usage pattern
+
+The most typical pattern pairs a position event listener with the corresponding commit function:
+
+```typescript
+import {
+  listenPartialProfitAvailable,
+  listenBreakevenAvailable,
+  commitPartialProfit,
+  commitBreakeven,
+} from "backtest-kit";
+
+// Take 30% profit at every 30% milestone
+listenPartialProfitAvailable(async (event) => {
+  if (event.level % 30 === 0) {
+    await commitPartialProfit(event.symbol, 30);
+  }
+});
+
+// Move stop-loss to breakeven when threshold is reached
+listenBreakevenAvailable(async (event) => {
+  await commitBreakeven(event.symbol);
+});
+```

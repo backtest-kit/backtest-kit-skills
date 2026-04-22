@@ -1,0 +1,508 @@
+---
+title: "Schema registration API: add, override, list, and get"
+description: "Register, override, list, and retrieve exchange, strategy, frame, risk, sizing, and walker schemas that power every backtest and live session."
+---
+
+Backtest Kit uses a registry pattern: you register schemas at startup, and the framework resolves them by name at runtime. Every schema type has four functions — `add*`, `override*`, `list*`, and `get*` — following a consistent convention.
+
+---
+
+## Exchange schemas
+
+An exchange schema provides candle data and price formatting for one data source.
+
+### `addExchangeSchema(schema)`
+
+```typescript
+import { addExchangeSchema } from "backtest-kit";
+
+addExchangeSchema({
+  exchangeName: "binance",
+  getCandles: async (symbol, interval, since, limit, backtest) => {
+    return await fetchFromBinance(symbol, interval, since, limit);
+  },
+  formatPrice: async (symbol, price, backtest) => price.toFixed(2),
+  formatQuantity: async (symbol, quantity, backtest) => quantity.toFixed(8),
+});
+```
+
+<ParamField body="exchangeName" type="string" required>
+  Unique identifier. Used as `exchangeName` in context objects passed to `Backtest.run()` and `Live.run()`.
+</ParamField>
+
+<ParamField body="getCandles" type="async (symbol, interval, since, limit, backtest) => Promise<IPublicCandleData[]>" required>
+  Fetches OHLCV candle data. `interval` is a `CandleInterval` string (`"1m"`, `"1h"`, `"1d"`, etc.). `since` is the start `Date`. `limit` is the maximum number of candles.
+</ParamField>
+
+<ParamField body="formatPrice" type="async (symbol, price, backtest) => Promise<string>">
+  Formats a raw price number to a string with the correct decimal precision for the exchange. Optional — defaults to 2 decimal places.
+</ParamField>
+
+<ParamField body="formatQuantity" type="async (symbol, quantity, backtest) => Promise<string>">
+  Formats a raw quantity number to a string. Optional — defaults to 8 decimal places.
+</ParamField>
+
+<ParamField body="getOrderBook" type="async (symbol, depth, from, to, backtest) => Promise<IOrderBookData>">
+  Optional. Fetches order book data. Throws if called without an implementation.
+</ParamField>
+
+<ParamField body="getAggregatedTrades" type="async (symbol, from, to, backtest) => Promise<IAggregatedTradeData[]>">
+  Optional. Fetches aggregated trade data. Throws if called without an implementation.
+</ParamField>
+
+<ParamField body="callbacks" type="Partial<IExchangeCallbacks>">
+  Optional. Supports `onCandleData(symbol, interval, since, limit, data)`.
+</ParamField>
+
+<ParamField body="note" type="string">
+  Optional developer note for documentation purposes.
+</ParamField>
+
+### `overrideExchangeSchema(schema)`
+
+```typescript
+import { overrideExchangeSchema } from "backtest-kit";
+
+await overrideExchangeSchema({
+  exchangeName: "binance",        // required — must already be registered
+  formatPrice: async (symbol, price) => price.toFixed(4),
+});
+```
+
+Performs a partial update. Only the fields you provide are changed. Throws if `exchangeName` is not registered. Returns the merged schema.
+
+### `listExchangeSchema()`
+
+```typescript
+const exchanges = await listExchangeSchema(); // Promise<IExchangeSchema[]>
+```
+
+Returns all registered exchange schemas as an array.
+
+### `getExchangeSchema(exchangeName)`
+
+```typescript
+const schema = getExchangeSchema("binance"); // IExchangeSchema
+```
+
+Returns the schema registered under `exchangeName`. Throws if not found.
+
+---
+
+## Strategy schemas
+
+A strategy schema defines signal generation logic and optional risk and action attachments.
+
+### `addStrategySchema(schema)`
+
+```typescript
+import { addStrategySchema } from "backtest-kit";
+
+addStrategySchema({
+  strategyName: "my-strategy",
+  interval: "5m",
+  getSignal: async (symbol, when, currentPrice) => {
+    // Return null to skip, or return a signal DTO to open a position
+    return {
+      position: "long",
+      priceTakeProfit: currentPrice * 1.02,
+      priceStopLoss: currentPrice * 0.99,
+      minuteEstimatedTime: 120,
+    };
+  },
+  callbacks: {
+    onOpen: (symbol, signal, currentPrice, backtest) => {
+      console.log("Opened:", signal.id);
+    },
+    onClose: (symbol, signal, priceClose, backtest) => {
+      console.log("Closed at:", priceClose);
+    },
+  },
+});
+```
+
+<ParamField body="strategyName" type="string" required>
+  Unique identifier. Used as `strategyName` in context objects.
+</ParamField>
+
+<ParamField body="getSignal" type="async (symbol, when, currentPrice) => Promise<ISignalDto | null>" required>
+  Signal generation function. Return `null` to produce no signal this tick. Return an `ISignalDto` to open a position. If `priceOpen` is included in the DTO, the signal becomes a scheduled entry waiting for price to reach that level.
+</ParamField>
+
+<ParamField body="interval" type="SignalInterval">
+  Throttle interval between `getSignal` calls. Accepted values: `"1m"`, `"3m"`, `"5m"`, `"15m"`, `"30m"`, `"1h"`. Defaults to `"1m"`.
+</ParamField>
+
+<ParamField body="riskName" type="string">
+  Optional. Attaches a single risk schema by name for position gating.
+</ParamField>
+
+<ParamField body="riskList" type="string[]">
+  Optional. Attaches multiple risk schemas. All must pass for a signal to be allowed.
+</ParamField>
+
+<ParamField body="actions" type="string[]">
+  Optional. List of action schema names to attach. Each action receives all signal lifecycle events.
+</ParamField>
+
+<ParamField body="callbacks" type="Partial<IStrategyCallbacks>">
+  Optional lifecycle callbacks. Supports `onOpen`, `onClose`, `onActive`, `onIdle`, `onSchedule`, `onCancel`, `onTick`, `onPartialProfit`, `onPartialLoss`, `onBreakeven`, `onSchedulePing`, `onActivePing`, and `onWrite`.
+</ParamField>
+
+<ParamField body="note" type="string">
+  Optional developer note.
+</ParamField>
+
+### `ISignalDto` fields
+
+<ParamField body="position" type='"long" | "short"' required>
+  Trade direction.
+</ParamField>
+
+<ParamField body="priceTakeProfit" type="number" required>
+  Take-profit price. Must be above `priceOpen` for long, below for short.
+</ParamField>
+
+<ParamField body="priceStopLoss" type="number" required>
+  Stop-loss price. Must be below `priceOpen` for long, above for short.
+</ParamField>
+
+<ParamField body="priceOpen" type="number">
+  Optional entry price. Omit to open immediately at the current VWAP. Provide to create a scheduled entry that waits for price to reach this level.
+</ParamField>
+
+<ParamField body="minuteEstimatedTime" type="number">
+  Maximum trade duration in minutes before `time_expired`. Use `Infinity` for no timeout.
+</ParamField>
+
+<ParamField body="cost" type="number">
+  Position cost in USD. Defaults to `GLOBAL_CONFIG.CC_POSITION_ENTRY_COST`.
+</ParamField>
+
+<ParamField body="note" type="string">
+  Human-readable signal description.
+</ParamField>
+
+### `overrideStrategySchema(schema)`
+
+```typescript
+await overrideStrategySchema({
+  strategyName: "my-strategy", // required
+  interval: "15m",             // only update interval
+});
+```
+
+### `listStrategySchema()`
+
+```typescript
+const strategies = await listStrategySchema(); // Promise<IStrategySchema[]>
+```
+
+### `getStrategySchema(strategyName)`
+
+```typescript
+const schema = getStrategySchema("my-strategy"); // IStrategySchema
+```
+
+---
+
+## Frame schemas
+
+A frame schema defines the time range and tick granularity for a backtest.
+
+### `addFrameSchema(schema)`
+
+```typescript
+import { addFrameSchema } from "backtest-kit";
+
+addFrameSchema({
+  frameName: "1d-backtest",
+  interval: "1m",
+  startDate: new Date("2024-01-01T00:00:00Z"),
+  endDate: new Date("2024-01-02T00:00:00Z"),
+});
+```
+
+<ParamField body="frameName" type="string" required>
+  Unique identifier. Used as `frameName` in `Backtest.run()` context and in walker schemas.
+</ParamField>
+
+<ParamField body="interval" type="FrameInterval" required>
+  Granularity of generated tick timestamps. Accepted values: `"1m"`, `"3m"`, `"5m"`, `"15m"`, `"30m"`, `"1h"`, `"2h"`, `"4h"`, `"6h"`, `"8h"`, `"12h"`, `"1d"`.
+</ParamField>
+
+<ParamField body="startDate" type="Date" required>
+  Start of the backtest period (inclusive).
+</ParamField>
+
+<ParamField body="endDate" type="Date" required>
+  End of the backtest period (inclusive).
+</ParamField>
+
+<ParamField body="callbacks" type="Partial<IFrameCallbacks>">
+  Optional. Supports `onTimeframe(timeframe, startDate, endDate, interval)`.
+</ParamField>
+
+<ParamField body="note" type="string">
+  Optional developer note.
+</ParamField>
+
+### `overrideFrameSchema(schema)`
+
+```typescript
+await overrideFrameSchema({
+  frameName: "1d-backtest",
+  endDate: new Date("2024-03-01T00:00:00Z"),
+});
+```
+
+### `listFrameSchema()`
+
+```typescript
+const frames = await listFrameSchema(); // Promise<IFrameSchema[]>
+```
+
+### `getFrameSchema(frameName)`
+
+```typescript
+const schema = getFrameSchema("1d-backtest"); // IFrameSchema
+```
+
+---
+
+## Risk schemas
+
+A risk schema gates signal creation across strategies with shared position limits and custom validation logic.
+
+### `addRiskSchema(schema)`
+
+```typescript
+import { addRiskSchema } from "backtest-kit";
+
+addRiskSchema({
+  riskName: "conservative",
+  maxConcurrentPositions: 5,
+  validations: [
+    {
+      validate: async ({ params }) => {
+        if (params.signal.cost > 500) {
+          throw new Error("Position cost exceeds $500 limit");
+        }
+      },
+      docDescription: "Caps individual position cost at $500",
+    },
+  ],
+  callbacks: {
+    onRejected: (symbol, reason, limit, params) => {
+      console.log(`[RISK] Rejected ${symbol}: ${reason}`);
+    },
+  },
+});
+```
+
+<ParamField body="riskName" type="string" required>
+  Unique identifier. Referenced via `riskName` or `riskList` in strategy schemas.
+</ParamField>
+
+<ParamField body="maxConcurrentPositions" type="number">
+  Optional. Maximum number of open positions across all strategies sharing this risk profile.
+</ParamField>
+
+<ParamField body="validations" type="Array<ValidationFn | { validate: ValidationFn; docDescription: string }>">
+  Optional. Array of custom async validation functions. Each receives a `params` object with `symbol`, `strategyName`, `exchangeName`, `signal`, `currentPrice`, and `timestamp`. Throw an `Error` to reject the signal.
+</ParamField>
+
+<ParamField body="callbacks" type="Partial<IRiskCallbacks>">
+  Optional. Supports `onRejected` and `onAllowed`.
+</ParamField>
+
+<ParamField body="note" type="string">
+  Optional developer note.
+</ParamField>
+
+### `overrideRiskSchema(schema)`
+
+```typescript
+await overrideRiskSchema({
+  riskName: "conservative",
+  maxConcurrentPositions: 3,
+});
+```
+
+### `listRiskSchema()`
+
+```typescript
+const risks = await listRiskSchema(); // Promise<IRiskSchema[]>
+```
+
+### `getRiskSchema(riskName)`
+
+```typescript
+const schema = getRiskSchema("conservative"); // IRiskSchema
+```
+
+---
+
+## Sizing schemas
+
+A sizing schema determines position size using one of three methods. The schema is a discriminated union on `method`.
+
+### `addSizingSchema(schema)`
+
+```typescript
+import { addSizingSchema } from "backtest-kit";
+
+// Fixed-percentage sizing
+addSizingSchema({
+  sizingName: "fixed-1pct",
+  method: "fixed-percentage",
+  riskPercentage: 1,
+  maxPositionPercentage: 10,
+});
+
+// Kelly Criterion sizing
+addSizingSchema({
+  sizingName: "kelly-quarter",
+  method: "kelly-criterion",
+  kellyMultiplier: 0.25,
+  maxPositionPercentage: 20,
+});
+
+// ATR-based sizing
+addSizingSchema({
+  sizingName: "atr-dynamic",
+  method: "atr-based",
+  riskPercentage: 2,
+  atrMultiplier: 2,
+});
+```
+
+<ParamField body="sizingName" type="string" required>
+  Unique identifier for the sizing configuration.
+</ParamField>
+
+<ParamField body="method" type='"fixed-percentage" | "kelly-criterion" | "atr-based"' required>
+  Sizing method. Determines which additional fields are used.
+</ParamField>
+
+<ParamField body="riskPercentage" type="number">
+  Required for `"fixed-percentage"` and `"atr-based"`. Percentage of account to risk per trade.
+</ParamField>
+
+<ParamField body="kellyMultiplier" type="number">
+  Required for `"kelly-criterion"`. Fraction of the Kelly-optimal size to use. `0.25` is a common conservative value.
+</ParamField>
+
+<ParamField body="atrMultiplier" type="number">
+  Required for `"atr-based"`. Multiplier applied to ATR when computing stop distance. Defaults to `2`.
+</ParamField>
+
+<ParamField body="maxPositionPercentage" type="number">
+  Optional. Cap on position size as a percentage of account equity.
+</ParamField>
+
+<ParamField body="minPositionSize" type="number">
+  Optional. Minimum position size in base asset units.
+</ParamField>
+
+<ParamField body="maxPositionSize" type="number">
+  Optional. Maximum position size in base asset units.
+</ParamField>
+
+<ParamField body="callbacks" type="Partial<ISizingCallbacks>">
+  Optional lifecycle callbacks. Supports `onCalculate(quantity, params)`.
+</ParamField>
+
+<ParamField body="note" type="string">
+  Optional developer note.
+</ParamField>
+
+### `overrideSizingSchema(schema)`
+
+```typescript
+await overrideSizingSchema({
+  sizingName: "fixed-1pct",
+  riskPercentage: 2,
+});
+```
+
+### `listSizingSchema()`
+
+```typescript
+const sizings = await listSizingSchema(); // Promise<ISizingSchema[]>
+```
+
+### `getSizingSchema(sizingName)`
+
+```typescript
+const schema = getSizingSchema("fixed-1pct"); // ISizingSchema
+```
+
+---
+
+## Walker schemas
+
+A walker schema defines an A/B comparison run across multiple strategies. See the [Walker reference](/api/walker) for runtime usage.
+
+### `addWalkerSchema(schema)`
+
+```typescript
+import { addWalkerSchema } from "backtest-kit";
+
+addWalkerSchema({
+  walkerName: "rsi-optimizer",
+  exchangeName: "binance",
+  frameName: "30d-backtest",
+  strategies: ["rsi-9", "rsi-14", "rsi-21"],
+  metric: "sharpeRatio",
+});
+```
+
+<ParamField body="walkerName" type="string" required>
+  Unique identifier. Used as `walkerName` in context objects passed to `Walker.run()`.
+</ParamField>
+
+<ParamField body="exchangeName" type="string" required>
+  Exchange schema to use for all strategy backtests.
+</ParamField>
+
+<ParamField body="frameName" type="string" required>
+  Frame schema defining the shared backtest date range.
+</ParamField>
+
+<ParamField body="strategies" type="string[]" required>
+  Ordered list of strategy names to compare. All must be registered via `addStrategySchema()`.
+</ParamField>
+
+<ParamField body="metric" type="WalkerMetric">
+  Metric used to rank strategies. Defaults to `"sharpeRatio"`. See [WalkerMetric values](/api/walker#walkermetric-values).
+</ParamField>
+
+<ParamField body="callbacks" type="Partial<IWalkerCallbacks>">
+  Optional. Supports `onStrategyStart`, `onStrategyComplete`, `onStrategyError`, and `onComplete`.
+</ParamField>
+
+<ParamField body="note" type="string">
+  Optional developer note.
+</ParamField>
+
+### `overrideWalkerSchema(schema)`
+
+```typescript
+await overrideWalkerSchema({
+  walkerName: "rsi-optimizer",
+  metric: "winRate",
+});
+```
+
+### `listWalkerSchema()`
+
+```typescript
+const walkers = await listWalkerSchema(); // Promise<IWalkerSchema[]>
+```
+
+### `getWalkerSchema(walkerName)`
+
+```typescript
+const schema = getWalkerSchema("rsi-optimizer"); // IWalkerSchema
+```
